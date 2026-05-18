@@ -48,6 +48,37 @@ CHAT_URL = f"{_GATEWAY}/v1/openai/chat/completions"
 REFRESH_URL = f"{_GATEWAY}/v1/refresh"
 
 # ---------------------------------------------------------------------------
+# Training images — loaded once at startup from services/ directory
+# ---------------------------------------------------------------------------
+_SERVICES_DIR = os.path.dirname(os.path.abspath(__file__))
+_TRAINING_IMAGES: List[str] = []  # list of base64-encoded JPG strings
+
+def _load_training_images() -> List[str]:
+    """
+    Load training1.jpg .. training5.jpg from the same directory as this file.
+    Returns list of base64 strings. Missing files are silently skipped.
+    """
+    images = []
+    for i in range(1, 6):
+        path = os.path.join(_SERVICES_DIR, f"training{i}.jpg")
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "rb") as f:
+                b64 = base64.b64encode(f.read()).decode()
+            images.append(b64)
+            print(f"📚 qwen_ai: training{i}.jpg loaded ({len(b64)//1024}KB)")
+        except Exception as e:
+            logger.warning(f"qwen_ai: failed to load training{i}.jpg — {e}")
+    if images:
+        print(f"📚 qwen_ai: {len(images)} training image(s) ready — will be sent with every analysis")
+    else:
+        print("⚠️  qwen_ai: no training images found in services/ (training1.jpg .. training5.jpg)")
+    return images
+
+_TRAINING_IMAGES = _load_training_images()
+
+# ---------------------------------------------------------------------------
 # Chart generation (matplotlib — non-interactive Agg backend)
 # ---------------------------------------------------------------------------
 try:
@@ -471,6 +502,28 @@ If there is NO clear void/imbalance setup → return "NO TRADE". Do NOT force a 
 
         # ── 3. Compose message ───────────
         content = []
+
+        # Training images first — gives AI visual reference for the strategy
+        if _TRAINING_IMAGES:
+            content.append({
+                "type": "text",
+                "text": (
+                    f"━━━ TRAINING REFERENCE CHARTS ({len(_TRAINING_IMAGES)} images) ━━━\n"
+                    "The following images are REAL TRADE EXAMPLES from the strategy you must replicate.\n"
+                    "Study the void/wick patterns in these charts — then apply the SAME logic to the live charts below."
+                ),
+            })
+            for img_b64 in _TRAINING_IMAGES:
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
+                })
+            content.append({
+                "type": "text",
+                "text": "━━━ END OF TRAINING REFERENCE ━━━\nNow analyze the LIVE charts below:",
+            })
+
+        # Live candlestick charts per timeframe
         for tf in ["5m", "15m", "30m", "1h", "4h"]:
             if tf in charts:
                 content.append({
