@@ -17,7 +17,7 @@ const nextConfig = {
     return [
       {
         source: '/api/:path*',
-        destination: 'https://web-production-e78a1.up.railway.app/api/:path*',
+        destination: 'https://grthrrh-production.up.railway.app/api/:path*',
       },
     ];
   },
