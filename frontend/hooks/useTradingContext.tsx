@@ -120,7 +120,7 @@ export function TradingProvider({ children }: { children: React.ReactNode }) {
   }, [isAuthenticated, userData]);
 
   useEffect(() => {
-    const wsHost = "web-production-e78a1.up.railway.app";
+    const wsHost = "grthrrh-production.up.railway.app";
     const wsProto = window.location.protocol === "https:" ? "wss:" : "ws:";
     const wsUrl = `${wsProto}//${wsHost}/api/bot/ws`;
     let ws: WebSocket | null = null;
