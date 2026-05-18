@@ -79,6 +79,8 @@ You will receive:
  2. The exact prompt the analysis AI received when it decided to enter this trade
  3. The analysis AI's full response that justified the entry
  4. The current position status and latest candle data
+ 5. Backend pre-computed context: Volume Delta/CVD, ADX momentum, swing structure,
+    liquidity sweep detection, session info, ATR pullback normalization, and thesis score
 
 CRITICAL TIME AWARENESS:
 - "OPENED AT" tells you how long this trade has been running.
@@ -89,14 +91,56 @@ CRITICAL TIME AWARENESS:
 - Price naturally moves against a new position briefly before reaching TP — do NOT mistake normal
   volatility for thesis invalidation.
 
+━━━ HOW TO USE BACKEND CONTEXT ━━━
+VOLUME DELTA / CVD:
+- LONG position: if buyer_pressure has turned "bearish" or delta_last_5 is strongly negative
+  → buyer exhaustion → consider SL+ or CLOSE
+- SHORT position: if buyer_pressure has turned "bullish" → seller exhaustion → consider SL+/CLOSE
+- If CVD diverges from price (price up but delta down for LONG) → early warning for SL+
+
+MOMENTUM (ADX):
+- ADX > 25: trend still strong → lean toward HOLD
+- ADX < 18: momentum dying → tighten SL or prepare to CLOSE
+- Candle velocity dropping + ADX collapsing → HOLD may not be optimal
+
+SWING STRUCTURE:
+- micro_break = true → structure broken → strong signal for CLOSE (not HOLD)
+- last_higher_low (for LONG) or last_lower_high (for SHORT) violated → CLOSE
+
+LIQUIDITY SWEEP:
+- If sweep_low_recovery detected on LONG → possible reversal → protect with SL+
+- If sweep_high_rejection detected on SHORT → possible reversal → SL+
+- Combined with delta divergence → CLOSE
+
+ATR PULLBACK NORMALIZATION (CRITICAL):
+- current_pullback < atr_normal_pullback → this is NORMAL retrace, NOT invalidation → HOLD
+- abnormal_move = true → this is beyond normal volatility → seriously consider CLOSE
+- Do NOT close a position just because price pulled back if abnormal_move = false
+
+SESSION AWARENESS:
+- ASIA session: volume thin — if floating profit, consider SL+
+- NY_OPEN / LONDON: expansion phase — give more room, lean HOLD
+- Session close / ASIA_PRE: if profit exists → consider SL+ to protect
+
+THESIS SCORE (backend scoring):
+- score >= 3: thesis mostly intact → HOLD unless other signals contradict
+- score == 2: borderline → use other signals to decide
+- score <= 1: thesis breaking down → lean CLOSE or at least SL+
+- structure_break = true → almost always CLOSE
+- momentum_shift = true → tighten or SL+
+
+INVALIDATION vs VOLATILITY RULE:
+- Normal retrace (abnormal_move=false) + thesis score >= 3 → HOLD, NOT CLOSE
+- Structure break (micro_break=true) OR abnormal_move=true → thesis may be broken
+
 You have THREE possible decisions:
 
 ━━━ CLOSE ━━━
 Use when:
 - The original thesis (trend/pattern/void/structure) has been clearly invalidated by NEW candle data
 - Clear reversal structure has formed AFTER entry (lower low for LONG / higher high for SHORT)
-- The specific pattern or level cited in the original analysis has broken
-- Momentum has definitively shifted with no recovery sign over multiple candles
+- micro_break = true in swing structure
+- Volume delta has strongly reversed against position AND momentum is weak
 - Risk/reward no longer justifies holding — better a small loss now than full SL
 
 ━━━ SL+ (Move Stop Loss) ━━━
@@ -107,11 +151,13 @@ Use when the position is in PROFIT and you want to lock in gains or protect brea
 - Classic use cases:
   • Move SL to break-even (entry price) once trade is in profit
   • Trail SL behind a recent swing low/high to lock partial gains
+  • Liquidity sweep detected + floating profit → SL+
+  • TP1 hit + thesis intact → SL+
 - When choosing SL+, you MUST provide a new_sl price:
-  • For LONG: new_sl must be ABOVE the current SL but BELOW current price (never above entry is fine too)
+  • For LONG: new_sl must be ABOVE the current SL but BELOW current price
   • For SHORT: new_sl must be BELOW the current SL but ABOVE current price
 - Do NOT use SL+ if the position is still at a loss — use HOLD or CLOSE instead.
-- Do NOT move SL+ so tight that normal volatility would immediately stop it out.
+- Do NOT move SL+ so tight that normal volatility (1x ATR) would immediately stop it out.
 
 ━━━ TP1 HIT → FORCE SL+ ━━━
 SPECIAL RULE: If ALL of the following are true, you MUST return SL+ (not HOLD):
@@ -126,10 +172,10 @@ SPECIAL RULE: If ALL of the following are true, you MUST return SL+ (not HOLD):
 Use when:
 - The original analysis thesis is still intact
 - Price is in normal pullback/consolidation within the trade direction
+- abnormal_move = false (ATR context confirms this is normal)
+- thesis_score >= 3 and no structure break
 - TP is still reachable from current price structure
 - The position was opened recently and no structural invalidation has occurred yet
-- Original void/pattern/level hasn't been violated
-- Trade is at a loss but thesis isn't broken — ride it out
 
 Rules:
 - Respond with EXACTLY this JSON and nothing else:
@@ -219,6 +265,7 @@ class PositionAIClient:
         original_ai_response: Optional[str] = None,
         sl_plus_history: Optional[list] = None,
         tp1: float = None,
+        position_context: dict = None,
     ) -> Optional[dict]:
         if direction == "LONG":
             pnl_pct = round((current_price - entry) / entry * 100, 3)
@@ -308,6 +355,66 @@ class PositionAIClient:
             lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
             sl_plus_block = "\n".join(lines)
 
+        # ── Build backend position context block ──────────────────────
+        pctx_block = ""
+        pc = position_context or {}
+        if pc:
+            session = pc.get("session", "UNKNOWN")
+            thesis = pc.get("thesis_score", {})
+            atr_ctx = pc.get("atr_context", {})
+            vd = pc.get("volume_delta", {})
+            momentum = pc.get("momentum", {})
+            swing_str = pc.get("swing_structure", {})
+            liq_sweep = pc.get("liquidity_sweep", {})
+
+            thesis_lines = (
+                f"  trend_intact={thesis.get('trend_intact')} | "
+                f"volume_support={thesis.get('volume_support')} | "
+                f"momentum_shift={thesis.get('momentum_shift')} | "
+                f"structure_break={thesis.get('structure_break')} | "
+                f"score={thesis.get('score')}/4"
+            ) if thesis else "  N/A"
+
+            atr_lines = "\n".join(
+                f"  {tf}: atr={v.get('atr')} normal_pullback={v.get('atr_normal_pullback')} "
+                f"current_pullback={v.get('current_pullback')} abnormal={v.get('abnormal_move')}"
+                for tf, v in atr_ctx.items()
+            ) if atr_ctx else "  N/A"
+
+            vd_lines = "\n".join(
+                f"  {tf}: cvd={v.get('cvd_last_20')} delta5={v.get('delta_last_5')} pressure={v.get('buyer_pressure')}"
+                for tf, v in vd.items()
+            ) if vd else "  N/A"
+
+            mom_lines = "\n".join(
+                f"  {tf}: adx={v.get('adx')} strength={v.get('trend_strength')} velocity={v.get('candle_velocity')}"
+                for tf, v in momentum.items()
+            ) if momentum else "  N/A"
+
+            swing_lines = "\n".join(
+                f"  {tf}: structure={v.get('structure')} micro_break={v.get('micro_break')} "
+                f"HH={v.get('last_hh')} HL={v.get('last_hl')} LH={v.get('last_lh')} LL={v.get('last_ll')}"
+                for tf, v in swing_str.items()
+            ) if swing_str else "  N/A"
+
+            sweep_lines = "\n".join(
+                f"  {tf}: detected={v.get('detected')} type={v.get('type')}"
+                for tf, v in liq_sweep.items()
+                if v.get("detected")
+            ) or "  None detected"
+
+            pctx_block = (
+                f"\n━━━ BACKEND POSITION CONTEXT (USE THIS FOR DECISION) ━━━\n"
+                f" Session: {session}\n"
+                f"\n Thesis Score:\n{thesis_lines}\n"
+                f"\n ATR Pullback Normalization:\n{atr_lines}\n"
+                f"\n Volume Delta / CVD:\n{vd_lines}\n"
+                f"\n Momentum (ADX):\n{mom_lines}\n"
+                f"\n Swing Structure:\n{swing_lines}\n"
+                f"\n Liquidity Sweeps:\n{sweep_lines}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            )
+
         # ── Build OHLCV blocks ─────────────────────────────────────────
         ohlcv_blocks = []
         for tf, candles in candles_by_tf.items():
@@ -337,6 +444,7 @@ class PositionAIClient:
             f" Leverage: {leverage}x\n"
             f" Margin Used: {margin_usdt} USDT\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"{pctx_block}"
             f"{chr(10).join(ohlcv_blocks)}\n\n"
             f"Charts attached above.\n"
             f"Remember: this position was opened {elapsed_str}. "
@@ -533,6 +641,7 @@ class PositionMonitorAI:
         original_ai_response: Optional[str] = None,
         sl_plus_history: Optional[list] = None,
         tp1: float = None,
+        position_context: dict = None,
         max_retries: int = 999,
     ) -> dict:
         """
@@ -569,6 +678,7 @@ class PositionMonitorAI:
                     original_ai_response=original_ai_response,
                     sl_plus_history=sl_plus_history,
                     tp1=tp1,
+                    position_context=position_context,
                 )
             except _ImageUploadFailed:
                 # Token ini gagal upload image — langsung rotate, tanpa sleep
