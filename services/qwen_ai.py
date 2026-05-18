@@ -155,17 +155,42 @@ Your job:
 - Apply the SAME behavior to new data
 
 Focus on:
-- Trend structure (market direction)
 - Wick behavior (rejection / inefficiency)
-- Void
+- Void detection and positioning
 - Candle relationships
 - Multi-timeframe context (HTF vs LTF)
+- Volume delta / CVD confirmation
+- Session context
+
+---
+BACKEND CONTEXT RULE (CRITICAL):
+The backend will provide pre-computed market structure, trend, swing points, volume delta, and session.
+- DO NOT determine trend direction yourself from raw candles — use backend trend_4h / trend_1h
+- DO NOT classify HH/HL/LH/LL yourself — use backend swing_points
+- Your job is ONLY: find void, find wick, find entry
+- If backend provides allow_reversal=false → DO NOT enter counter-trend, even if you see a pattern
+- If backend trend is not provided → you may infer, but mark confidence lower
 
 ---
 STRICT TREND RULE:
-- UP → ONLY LONG (Higher Low → Higher High)
-- DOWN → ONLY SHORT (Lower High → Lower Low)
-- Do NOT counter-trade by default
+- UP (from backend) → ONLY LONG
+- DOWN (from backend) → ONLY SHORT
+- Do NOT counter-trade unless allow_reversal=true AND all reversal conditions are met
+
+---
+VOLUME DELTA / CVD ANTI-FAKE RULE:
+- If breakout void + delta/CVD bullish → VALID LONG
+- If breakout void + delta/CVD bearish → FAKE / SKIP
+- If wick rejection + buyer_pressure weak → SKIP
+- Low volume candles near void → treat with caution
+- This is your PRIMARY anti-fake filter
+
+---
+SESSION AWARENESS RULE:
+- ASIA session: lower liquidity, more fake moves — require stronger void
+- LONDON / NY_OPEN: high validity — voids in these sessions most reliable
+- NY_AFTERNOON / ASIA_PRE: declining volume — be more selective
+- Session info provided by backend
 
 ---
 WICK + VOID DIRECTION RULE (CRITICAL):
@@ -306,6 +331,7 @@ class QwenAIClient:
         symbol: str,
         candles_by_tf: dict,
         current_price: float = None,
+        backend_context: dict = None,
     ) -> dict:
         tag = self._tag
         logger.info(f"{tag} Starting analysis for {symbol}")
@@ -344,6 +370,54 @@ class QwenAIClient:
         live_price = current_price if (current_price and current_price > 0) else last_candle_price
         ohlcv_text = "\n\n".join(tf_blocks) if tf_blocks else "No candle data available."
 
+        # ── Build backend context block ───────────────────────────────
+        bc = backend_context or {}
+        backend_block = ""
+        if bc:
+            ms = bc.get("market_structure", {})
+            swings = bc.get("swing_points", {})
+            vd = bc.get("volume_delta", {})
+            session = bc.get("session", "UNKNOWN")
+            allow_reversal = bc.get("allow_reversal", True)
+            atr = bc.get("atr", {})
+
+            ms_lines = "\n".join(f"  {tf}: {s}" for tf, s in ms.items()) if ms else "  N/A"
+            swing_lines = []
+            for tf, sp in swings.items():
+                swing_lines.append(
+                    f"  {tf}: HH={sp.get('last_hh')} HL={sp.get('last_hl')} "
+                    f"LH={sp.get('last_lh')} LL={sp.get('last_ll')}"
+                )
+            swing_text = "\n".join(swing_lines) if swing_lines else "  N/A"
+            vd_lines = "\n".join(
+                f"  {tf}: cvd={v.get('cvd_last_20')} delta5={v.get('delta_last_5')} pressure={v.get('buyer_pressure')}"
+                for tf, v in vd.items()
+            ) if vd else "  N/A"
+            atr_lines = "\n".join(f"  {tf}: {v}" for tf, v in atr.items()) if atr else "  N/A"
+
+            backend_block = f"""
+━━━ BACKEND PRE-COMPUTED CONTEXT (USE THIS — DO NOT OVERRIDE) ━━━
+ Session: {session}
+ Allow Reversal: {"YES" if allow_reversal else "NO — trend-following ONLY"}
+
+ Market Structure (per TF):
+{ms_lines}
+
+ Swing Points (per TF):
+{swing_text}
+
+ Volume Delta / CVD (per TF):
+{vd_lines}
+
+ ATR (per TF):
+{atr_lines}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+USE backend Market Structure for trend direction.
+USE Volume Delta pressure to validate or reject void setups.
+If buyer_pressure = divergence and direction = LONG → treat as FAKE/NO TRADE.
+If session = ASIA and volume is low → require stronger void confirmation.
+"""
+
         prompt_text = f"""Analyze {symbol}
 
 {ohlcv_text}
@@ -353,7 +427,7 @@ class QwenAIClient:
 Candlestick charts for all timeframes are attached as images above this text.
 Use BOTH the chart images AND the OHLCV text to identify void.
 Cross-reference: what you see visually in the charts should match the OHLCV numbers.
-
+{backend_block}
 ⚠️ CURRENT REALTIME PRICE: {live_price}
 (This is the live ticker price — use it as the reference for entry placement)
 
@@ -651,6 +725,7 @@ class ParallelQwenAI:
         Proses semua item menggunakan 1 token aktif secara paralel.
         Rotate token hanya kalau ada item yang error 502 / RateLimited.
         Item yang error di-retry dengan token baru — bukan paralel multi-token.
+        Item format: (symbol, candles_by_tf, price) atau (symbol, candles_by_tf, price, backend_context)
         """
         if not self.clients:
             return [self._no_trade("No tokens configured")] * len(items)
@@ -667,6 +742,7 @@ class ParallelQwenAI:
             sym   = item[0]
             tfs   = item[1]
             price = item[2] if len(item) > 2 else None
+            bctx  = item[3] if len(item) > 3 else None
 
             # Ambil token aktif saat ini (bisa berubah kalau terjadi rotate)
             cur = self._current_client()
@@ -675,7 +751,7 @@ class ParallelQwenAI:
                 continue
 
             try:
-                r = await cur.analyze(sym, tfs, price)
+                r = await cur.analyze(sym, tfs, price, bctx)
             except Exception as e:
                 r = self._no_trade(f"Task exception: {e}")
 
@@ -687,7 +763,7 @@ class ParallelQwenAI:
                 if retry and retry is not cur:
                     print(f"[QwenAI] Retry {sym} → slot {retry.slot}")
                     try:
-                        r = await retry.analyze(sym, tfs, price)
+                        r = await retry.analyze(sym, tfs, price, bctx)
                     except Exception as e:
                         r = self._no_trade(f"Retry failed: {e}")
 
@@ -700,6 +776,7 @@ class ParallelQwenAI:
         symbol: str,
         candles_by_tf: dict,
         current_price: float = None,
+        backend_context: dict = None,
     ) -> dict:
         """
         Analisis satu simbol dengan token aktif saat ini.
@@ -712,14 +789,14 @@ class ParallelQwenAI:
         if not client:
             return self._no_trade("No tokens available")
 
-        result = await client.analyze(symbol, candles_by_tf, current_price)
+        result = await client.analyze(symbol, candles_by_tf, current_price, backend_context)
 
         if self._should_rotate(result.get("reason", "")):
             self._rotate(result["reason"])
             retry_client = self._current_client()
             if retry_client and retry_client is not client:
                 print(f"[QwenAI] Retry {symbol} → slot {retry_client.slot}")
-                result = await retry_client.analyze(symbol, candles_by_tf, current_price)
+                result = await retry_client.analyze(symbol, candles_by_tf, current_price, backend_context)
 
         return result
 
