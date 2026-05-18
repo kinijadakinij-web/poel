@@ -311,7 +311,9 @@ class BotEngine:
 
                     # Analisis AI — 1 simbol, 1 token, sequential
                     print(f" Sending AI request for {sym}…")
-                    signal = await qwen_ai.analyze(sym, candles_by_tf, current_price)
+                    from utils.indicators import compute_backend_context
+                    backend_ctx = compute_backend_context(candles_by_tf)
+                    signal = await qwen_ai.analyze(sym, candles_by_tf, current_price, backend_ctx)
 
                     found = self._process_signal(sym, current_price, signal)
                     if found:
@@ -656,6 +658,11 @@ class BotEngine:
                         print(f" 🤖 {sig_id} no candle data — skipping AI check")
                         continue
 
+                    from utils.indicators import compute_position_backend_context
+                    pos_ctx = compute_position_backend_context(
+                        candles_by_tf, direction, entry, tp1=signal.get("tp1")
+                    )
+
                     ai_result = await position_ai.decide_with_retry(
                         symbol=symbol,
                         direction=direction,
@@ -669,6 +676,7 @@ class BotEngine:
                         original_analysis=original_analysis,
                         sl_plus_history=signal.get("sl_plus_history") or [],
                         tp1=signal.get("tp1"),
+                        position_context=pos_ctx,
                     )
 
                     signal["last_ai_decision"] = ai_result.get("decision")
