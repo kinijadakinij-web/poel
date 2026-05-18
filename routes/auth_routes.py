@@ -40,7 +40,7 @@ def require_admin(user=Depends(get_current_user)):
         raise HTTPException(status_code=403, detail="Admin access required")
     return user
 
-@router.post("/api/auth/login")
+@router.post("/login")
 async def login(data: LoginData):
     user = authenticate_user(data.username, data.passkey)
     if not user:
@@ -60,7 +60,7 @@ async def login(data: LoginData):
         }
     }
 
-@router.post("/api/auth/register")
+@router.post("/register")
 async def register(data: RegisterData, admin=Depends(require_admin)):
     if get_user_by_username(data.username):
         raise HTTPException(status_code=400, detail="Username already exists")
@@ -76,7 +76,7 @@ async def register(data: RegisterData, admin=Depends(require_admin)):
     )
     return {"success": True, "user_id": uid}
 
-@router.get("/api/auth/me")
+@router.get("/me")
 async def me(user=Depends(get_current_user)):
     return {
         "id": user["id"],
@@ -88,12 +88,12 @@ async def me(user=Depends(get_current_user)):
         "initial_balance": user["initial_balance"],
     }
 
-@router.get("/api/auth/users")
+@router.get("/users")
 async def get_users(admin=Depends(require_admin)):
     users = list_users()
     return {"data": [{k: u[k] for k in u if k != "passkey_hash"} for u in users]}
 
-@router.post("/api/auth/users/{user_id}/update")
+@router.post("/users/{user_id}/update")
 async def update_user_data(user_id: str, data: dict, admin=Depends(require_admin)):
     allowed = {"leverage", "margin", "balance"}
     updates = {k: v for k, v in data.items() if k in allowed}
