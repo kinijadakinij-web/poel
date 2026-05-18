@@ -46,12 +46,13 @@ if _GATEWAY_RAW and not _GATEWAY_RAW.startswith(("http://", "https://")):
     _GATEWAY_RAW = "https://" + _GATEWAY_RAW
 _GATEWAY = _GATEWAY_RAW or "https://qwen-web-gateway.onrender.com"
 
-QWEN_MODEL = os.getenv("QWEN_MODEL", "qwen3.6-plus")
-QWEN_THINKING = os.getenv("QWEN_THINKING_MODE", "Thinking")
+QWEN_MODEL = os.getenv("QWEN_MODEL", "").strip() or "qwen3.6-plus"
+QWEN_THINKING = os.getenv("QWEN_THINKING_MODE", "").strip() or "Thinking"
 
 CHAT_URL = f"{_GATEWAY}/v1/openai/chat/completions"
 REFRESH_URL = f"{_GATEWAY}/v1/refresh"
 print(f"🌐 qwen_ai: gateway = {_GATEWAY}")
+print(f"[qwen_ai] model={QWEN_MODEL!r} thinking={QWEN_THINKING!r}")
 
 # ---------------------------------------------------------------------------
 # Training images — loaded once at startup from services/ directory
@@ -623,18 +624,18 @@ If there is NO clear void/imbalance setup → return "NO TRADE". Do NOT force a 
             message = data.get("choices", [{}])[0].get("message", {})
 
             # Collect all text candidates
-            candidates = []
-            content = message.get("content") or ""
+            # NOTE: use msg_content to avoid shadowing the payload `content` list built above
+            msg_content = message.get("content") or ""
             reasoning = message.get("reasoning_content") or ""
             # Some gateway versions use these keys
             think_content = message.get("think_content") or ""
             answer_content = message.get("answer_content") or ""
 
-            candidates = [content, answer_content, reasoning, think_content]
+            candidates = [msg_content, answer_content, reasoning, think_content]
 
             # Log raw structure for debugging
             print(f"{tag} DEBUG [{symbol}] message keys: {list(message.keys())}")
-            print(f"{tag} DEBUG content={len(content)}ch reasoning={len(reasoning)}ch answer={len(answer_content)}ch")
+            print(f"{tag} DEBUG content={len(msg_content)}ch reasoning={len(reasoning)}ch answer={len(answer_content)}ch")
 
             # Remove <think>...</think> blocks — they contain reasoning, not JSON
             import re
