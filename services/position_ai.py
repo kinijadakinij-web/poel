@@ -532,11 +532,30 @@ class PositionAIClient:
             return None
 
         try:
-            full_text = (
-                data.get("choices", [{}])[0]
-                .get("message", {})
-                .get("content", "") or ""
-            )
+            import re
+            message = data.get("choices", [{}])[0].get("message", {})
+
+            def strip_think_tags(text: str) -> str:
+                return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+            candidates = [
+                message.get("content") or "",
+                message.get("answer_content") or "",
+                message.get("reasoning_content") or "",
+                message.get("think_content") or "",
+            ]
+            print(f"[PositionAI] DEBUG [{symbol}] keys={list(message.keys())} lens={[len(c) for c in candidates]}")
+
+            full_text = ""
+            for candidate in candidates:
+                if not candidate:
+                    continue
+                cleaned = strip_think_tags(candidate)
+                if "{" in cleaned and "}" in cleaned:
+                    full_text = cleaned
+                    break
+            if not full_text:
+                full_text = strip_think_tags(" ".join(c for c in candidates if c))
         except Exception:
             return None
 
