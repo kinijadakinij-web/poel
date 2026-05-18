@@ -40,12 +40,18 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Config (Railway env vars)
 # ---------------------------------------------------------------------------
-_GATEWAY = os.getenv("QWEN_BASE_URL", "https://qwen-web-gateway.onrender.com")
+_GATEWAY_RAW = os.getenv("QWEN_BASE_URL", "https://qwen-web-gateway.onrender.com").strip().rstrip("/")
+# Auto-fix missing protocol — common Railway misconfiguration
+if _GATEWAY_RAW and not _GATEWAY_RAW.startswith(("http://", "https://")):
+    _GATEWAY_RAW = "https://" + _GATEWAY_RAW
+_GATEWAY = _GATEWAY_RAW or "https://qwen-web-gateway.onrender.com"
+
 QWEN_MODEL = os.getenv("QWEN_MODEL", "qwen3.6-plus")
 QWEN_THINKING = os.getenv("QWEN_THINKING_MODE", "Thinking")
 
 CHAT_URL = f"{_GATEWAY}/v1/openai/chat/completions"
 REFRESH_URL = f"{_GATEWAY}/v1/refresh"
+print(f"🌐 qwen_ai: gateway = {_GATEWAY}")
 
 # ---------------------------------------------------------------------------
 # Training images — loaded once at startup from services/ directory
@@ -608,14 +614,52 @@ If there is NO clear void/imbalance setup → return "NO TRADE". Do NOT force a 
             return self._no_trade("No response after retries")
 
         # ── 5. Extract response text ──────────────────────────────────
+        # Qwen thinking mode returns content in multiple possible locations:
+        # 1. choices[0].message.content          — normal / fast mode
+        # 2. choices[0].message.reasoning_content — thinking mode (reasoning)
+        # 3. content may contain <think>...</think> wrapping the actual JSON
+        # Strategy: try all locations, strip <think> tags, find the JSON block
         try:
-            full_text = (
-                data.get("choices", [{}])[0]
-                .get("message", {})
-                .get("content", "")
-                or ""
-            )
-        except Exception:
+            message = data.get("choices", [{}])[0].get("message", {})
+
+            # Collect all text candidates
+            candidates = []
+            content = message.get("content") or ""
+            reasoning = message.get("reasoning_content") or ""
+            # Some gateway versions use these keys
+            think_content = message.get("think_content") or ""
+            answer_content = message.get("answer_content") or ""
+
+            candidates = [content, answer_content, reasoning, think_content]
+
+            # Log raw structure for debugging
+            print(f"{tag} DEBUG [{symbol}] message keys: {list(message.keys())}")
+            print(f"{tag} DEBUG content={len(content)}ch reasoning={len(reasoning)}ch answer={len(answer_content)}ch")
+
+            # Remove <think>...</think> blocks — they contain reasoning, not JSON
+            import re
+            def strip_think_tags(text: str) -> str:
+                # Remove full <think>...</think> blocks
+                cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+                return cleaned
+
+            full_text = ""
+            for candidate in candidates:
+                if not candidate:
+                    continue
+                cleaned = strip_think_tags(candidate)
+                # Check if this candidate contains a JSON block
+                if "{" in cleaned and "}" in cleaned:
+                    full_text = cleaned
+                    break
+
+            # Fallback: concatenate all and try to find JSON anywhere
+            if not full_text:
+                combined = " ".join(c for c in candidates if c)
+                full_text = strip_think_tags(combined)
+
+        except Exception as e:
+            logger.error(f"{tag} Content extraction error for {symbol}: {e}")
             return self._no_trade("Failed to extract response content")
 
         logger.info(f"{tag} Raw response for {symbol} ({len(full_text)} chars):\n{full_text[:600]}")
