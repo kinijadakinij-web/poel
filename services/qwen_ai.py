@@ -265,18 +265,16 @@ async def _send_stream(
                 finish_reason = choices[0].get("finish_reason", "")
 
                 if phase == "thinking_summary":
-                    # Accumulate thinking summary — final entry is the complete thought
+                    # Internal reasoning phase — store as fallback only.
+                    # DO NOT break here; the actual JSON answer arrives as
+                    # regular content chunks AFTER thinking finishes.
                     thoughts = extra.get("summary_thought", {}).get("content", [])
                     if thoughts:
                         full_thoughts = thoughts
-                    if status == "finished":
-                        # Use the last (most complete) thought as the final reply
-                        if full_thoughts:
-                            full_reply = full_thoughts[-1].strip()
-                        break
-                elif content_chunk:
-                    # Fallback: streaming content chunks (non-thinking mode)
-                    full_reply += content_chunk
+                else:
+                    # Regular answer chunks (JSON response lives here)
+                    if content_chunk:
+                        full_reply += content_chunk
 
                 if finish_reason == "stop":
                     break
