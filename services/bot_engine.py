@@ -29,6 +29,7 @@ MAX_ACTIVE_SIGNALS = int(os.getenv("MAX_ACTIVE_SIGNALS", "20"))
 
 REQUIRED_SYMBOLS = ["BTC_USDT", "ETH_USDT", "SOL_USDT"]
 INTER_SYMBOL_DELAY = float(os.getenv("INTER_SYMBOL_DELAY", "2.0"))
+SCAN_BATCH_SIZE = int(os.getenv("SCAN_BATCH_SIZE", "3"))  # simbol paralel per iterasi
 
 KEEPALIVE_URL = os.getenv("KEEPALIVE_URL", "")
 KEEPALIVE_INTERVAL = int(os.getenv("KEEPALIVE_INTERVAL", "240"))
@@ -275,9 +276,10 @@ class BotEngine:
                     continue
 
                 slots_needed = MAX_ACTIVE_SIGNALS - active
-                print(f"\n[Loop] Active={active}/{MAX_ACTIVE_SIGNALS} — scanning for {slots_needed} more signal(s)")
 
-                pool = await self._build_pool(exclude=self._pass_scanned)
+                # Exclude symbols yang sudah punya OPEN signal agar tidak double-signal
+                open_syms = self._get_open_symbols()
+                pool = await self._build_pool(exclude=self._pass_scanned | open_syms)
 
                 if not pool:
                     print("[Loop] Pass exhausted — resetting scanned set for next pass")
@@ -286,44 +288,70 @@ class BotEngine:
                     continue
 
                 self.state["status"] = "RUNNING"
+                print(
+                    f"\n[Loop] Active={active}/{MAX_ACTIVE_SIGNALS} "
+                    f"slots_needed={slots_needed} "
+                    f"pool={len(pool)} batch={SCAN_BATCH_SIZE}"
+                )
+                if open_syms:
+                    print(f"[Loop] Skipping {len(open_syms)} already-open symbol(s): "
+                          f"{', '.join(sorted(open_syms))}")
 
-                for sym in pool:
-                    if not self.running:
-                        break
+                # ── Iterasi pool dalam batch SCAN_BATCH_SIZE ──────────────────
+                i = 0
+                while i < len(pool) and self.running:
                     if self._active_count() >= MAX_ACTIVE_SIGNALS:
                         break
 
-                    print(f"\n[Scan] {sym}")
-                    self._emit("status", f"Scanning: {sym}")
+                    batch_syms = pool[i:i + SCAN_BATCH_SIZE]
+                    i += SCAN_BATCH_SIZE
 
-                    # Fetch market data untuk simbol ini (timeframes tetap paralel — beda endpoint)
-                    mresult = await self._fetch_market_data(sym)
-                    self._pass_scanned.add(sym)
+                    print(f"\n[Batch] Scanning: {', '.join(batch_syms)}")
+                    self._emit("status", f"Scanning: {', '.join(batch_syms)}")
 
-                    if mresult is None:
+                    # ── Fetch market data untuk semua simbol di batch secara paralel ──
+                    fetch_tasks = [self._fetch_market_data(sym) for sym in batch_syms]
+                    fetch_results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
+
+                    # Tandai sudah di-scan (terlepas berhasil atau tidak)
+                    for sym in batch_syms:
+                        self._pass_scanned.add(sym)
+
+                    # ── Bangun daftar item yang valid untuk analisis AI ──────────
+                    ai_batch = []
+                    for sym, result in zip(batch_syms, fetch_results):
+                        if isinstance(result, Exception) or result is None:
+                            logger.debug(f"[Batch] {sym} market data fetch failed: {result}")
+                            continue
+                        candles_by_tf, current_price = result
+                        if not candles_by_tf or current_price <= 0:
+                            continue
+                        from utils.indicators import compute_backend_context
+                        backend_ctx = compute_backend_context(candles_by_tf)
+                        ai_batch.append((sym, candles_by_tf, current_price, backend_ctx))
+
+                    if not ai_batch:
                         await asyncio.sleep(INTER_SYMBOL_DELAY)
                         continue
 
-                    candles_by_tf, current_price = mresult
-                    if not candles_by_tf or current_price <= 0:
-                        await asyncio.sleep(INTER_SYMBOL_DELAY)
-                        continue
+                    # ── Kirim ke AI secara paralel (tiap simbol pakai token berbeda) ──
+                    print(f" Sending {len(ai_batch)} parallel AI request(s): "
+                          f"{[x[0] for x in ai_batch]}")
+                    ai_results = await qwen_ai.analyze_parallel(
+                        ai_batch, concurrency=SCAN_BATCH_SIZE
+                    )
 
-                    # Analisis AI — 1 simbol, 1 token, sequential
-                    print(f" Sending AI request for {sym}…")
-                    from utils.indicators import compute_backend_context
-                    backend_ctx = compute_backend_context(candles_by_tf)
-                    signal = await qwen_ai.analyze(sym, candles_by_tf, current_price, backend_ctx)
-
-                    found = self._process_signal(sym, current_price, signal)
-                    if found:
-                        self._emit("progress", {
-                            "active_signal_count": self._active_count(),
-                            "max_active_signals": MAX_ACTIVE_SIGNALS,
-                            "symbols_scanned": self.state["symbols_scanned"],
-                        })
-                    if self._active_count() >= MAX_ACTIVE_SIGNALS:
-                        break
+                    # ── Proses hasil ────────────────────────────────────────────
+                    for (sym, _, current_price, _), signal in zip(ai_batch, ai_results):
+                        found = self._process_signal(sym, current_price, signal)
+                        if found:
+                            self._emit("progress", {
+                                "active_signal_count": self._active_count(),
+                                "max_active_signals": MAX_ACTIVE_SIGNALS,
+                                "symbols_scanned": self.state["symbols_scanned"],
+                            })
+                        if self._active_count() >= MAX_ACTIVE_SIGNALS:
+                            break
 
                     await asyncio.sleep(INTER_SYMBOL_DELAY)
 
@@ -843,6 +871,13 @@ class BotEngine:
             if s["id"] == sig_id:
                 return s
         return None
+
+    def _get_open_symbols(self) -> set:
+        """
+        Return set simbol yang sudah punya signal OPEN (entry_hit atau masih pending).
+        Scanner akan skip simbol ini supaya tidak double-signal pada coin yang sama.
+        """
+        return {s["symbol"] for s in self.state["signals"] if s.get("status") == "OPEN"}
 
     def get_state(self) -> dict:
         wins = self.state["win_count"]
