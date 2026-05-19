@@ -669,15 +669,36 @@ If buyer_pressure = divergence and direction = LONG → treat as FAKE/NO TRADE.
 If session = ASIA and volume is low → require stronger void confirmation.
 """
 
+        # Build training image description block
+        n_training = len(_TRAINING_IMAGES)
+        n_charts = len(charts)
+        if n_training > 0:
+            training_img_block = f"""---
+TRAINING REFERENCE IMAGES ({n_training} image{'s' if n_training > 1 else ''}):
+The first {n_training} image{'s' if n_training > 1 else ''} attached (before the candlestick charts) are REAL TRADE EXAMPLES from the target strategy.
+Each image shows an annotated chart of a valid setup: void location, wick structure, entry zone, and TP/SL placement.
+Study these images carefully to understand the VISUAL PATTERN you must replicate.
+Use them as ground truth for what a valid void/wick setup looks like.
+"""
+        else:
+            training_img_block = ""
+
+        if n_charts > 0:
+            chart_img_block = f"""---
+LIVE CANDLESTICK CHARTS ({n_charts} image{'s' if n_charts > 1 else ''} — timeframes: {', '.join(charts.keys())}):
+The remaining images are server-generated candlestick charts of the current {symbol} data.
+Use BOTH the chart images AND the OHLCV text to identify void.
+Cross-reference: what you see visually in the charts should match the OHLCV numbers.
+"""
+        else:
+            chart_img_block = ""
+
         prompt_text = f"""Analyze {symbol}
 
 {ohlcv_text}
 
----
-
-Candlestick charts for all timeframes are attached as images above this text.
-Use BOTH the chart images AND the OHLCV text to identify void.
-Cross-reference: what you see visually in the charts should match the OHLCV numbers.
+{training_img_block}
+{chart_img_block}
 {backend_block}
 ⚠️ CURRENT REALTIME PRICE: {live_price}
 (This is the live ticker price — use it as the reference for entry placement)
