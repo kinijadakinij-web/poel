@@ -17,6 +17,7 @@ Env vars:
 """
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -29,10 +30,12 @@ import httpx
 from services.qwen_ai import (
     _draw_chart,
     HAS_CHARTS,
-    CHAT_URL,
-    REFRESH_URL,
     QWEN_MODEL,
     QWEN_THINKING,
+    _create_chat,
+    _delete_chat,
+    _upload_image_bytes,
+    _send_stream,
 )
 from services.ai_lock import ai_lock
 
@@ -227,25 +230,7 @@ class PositionAIClient:
         self.exhausted = False  # True kalau kena rate limit harian
 
     async def _refresh(self) -> bool:
-        try:
-            resp = await self.client.get(
-                REFRESH_URL,
-                headers={"Authorization": f"Bearer {self.token}"},
-                timeout=30,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                new_token = (
-                    data.get("token")
-                    or data.get("access_token")
-                    or data.get("data", {}).get("token")
-                )
-                if new_token:
-                    self.token = new_token
-                    print("[PositionAI] token refreshed")
-                    return True
-        except Exception as e:
-            logger.warning(f"[PositionAI] Token refresh failed: {e}")
+        """Token refresh not applicable with reverse API."""
         return False
 
     async def decide(
@@ -454,110 +439,53 @@ class PositionAIClient:
             f'For SL+: provide new_sl as a number (new stop-loss price). For HOLD/CLOSE: new_sl must be null.'
         )
 
-        content = []
+        # Upload chart images to OSS
+        uploaded_files = []
         if HAS_CHARTS:
             for tf, candles in candles_by_tf.items():
                 img = _draw_chart(candles, symbol, tf)
                 if img:
-                    content.append({
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/png;base64,{img}"},
-                    })
-        content.append({"type": "text", "text": user_text})
+                    uf = await _upload_image_bytes(
+                        self.token, base64.b64decode(img),
+                        f"pos_{symbol}_{tf}.png", "image/png", self.client,
+                    )
+                    if uf:
+                        uploaded_files.append(uf)
 
-        payload = {
-            "model": QWEN_MODEL,
-            "messages": [
-                {"role": "system", "content": POSITION_SYSTEM_PROMPT},
-                {"role": "user", "content": content},
-            ],
-            "stream": False,
-            "thinking_mode": QWEN_THINKING,
-            "max_tokens": 400,
-        }
+        full_prompt = POSITION_SYSTEM_PROMPT + "\n\n---\n\n" + user_text
 
+        full_text = ""
         lock = ai_lock()
         print(f"[PositionAI] waiting for lock ({symbol} {direction} pnl={sign}{pnl_pct}% elapsed={elapsed_str})")
         async with lock:
             print(f"[PositionAI] lock acquired → hold/close query for {symbol}")
-            data = None
             for attempt in range(2):
                 try:
-                    resp = await self.client.post(
-                        CHAT_URL,
-                        headers={
-                            "Authorization": f"Bearer {self.token}",
-                            "Content-Type": "application/json",
-                        },
-                        json=payload,
-                    )
-                    if resp.status_code == 401:
-                        if attempt == 0 and await self._refresh():
+                    chat_id = await _create_chat(self.token, self.client)
+                    if not chat_id:
+                        if attempt == 0:
                             continue
                         return None
-                    if resp.status_code == 429:
-                        self.exhausted = True
-                        print(f"[PositionAI] 🚫 Token slot={self.slot} rate-limited (429) — marked exhausted")
-                        return None
-                    if resp.status_code == 502:
-                        try:
-                            err = resp.json().get("error", {})
-                            code = err.get("code", "")
-                            detail = err.get("details", "") or err.get("message", "")
-                        except Exception:
-                            code, detail = "", ""
-                        if code == "RateLimited" or "upper limit" in detail.lower() or "usage" in detail.lower():
-                            self.exhausted = True
-                            print(f"[PositionAI] 🚫 Token slot={self.slot} daily limit — marked exhausted")
-                            return None
-                        if code == "image_upload_failed":
-                            # Jangan retry text-only — raise supaya pool bisa rotate ke token lain
-                            print(f"[PositionAI] ⚠️ Image upload failed slot={self.slot} — raising for token rotation")
-                            raise _ImageUploadFailed(f"image_upload_failed on slot {self.slot}")
-                        logger.error(f"[PositionAI] HTTP 502 slot={self.slot}: {resp.text[:200]}")
-                        return None
-                    if resp.status_code != 200:
-                        logger.error(f"[PositionAI] HTTP {resp.status_code}: {resp.text[:200]}")
-                        return None
-                    data = resp.json()
-                    break
+
+                    raw_reply = await _send_stream(
+                        self.token, chat_id, full_prompt, self.client, uploaded_files or None
+                    )
+                    await _delete_chat(self.token, chat_id, self.client)
+
+                    if raw_reply:
+                        import re
+                        full_text = re.sub(r"<think>.*?</think>", "", raw_reply, flags=re.DOTALL).strip()
+                        break
+
+                    if attempt == 0:
+                        continue
+                    return None
                 except httpx.TimeoutException:
                     print(f"[PositionAI] timeout for {symbol} — will retry")
                     return None
                 except Exception as e:
                     logger.error(f"[PositionAI] {e}")
                     return None
-
-        if not data:
-            return None
-
-        try:
-            import re
-            message = data.get("choices", [{}])[0].get("message", {})
-
-            def strip_think_tags(text: str) -> str:
-                return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-
-            candidates = [
-                message.get("content") or "",
-                message.get("answer_content") or "",
-                message.get("reasoning_content") or "",
-                message.get("think_content") or "",
-            ]
-            print(f"[PositionAI] DEBUG [{symbol}] keys={list(message.keys())} lens={[len(c) for c in candidates]}")
-
-            full_text = ""
-            for candidate in candidates:
-                if not candidate:
-                    continue
-                cleaned = strip_think_tags(candidate)
-                if "{" in cleaned and "}" in cleaned:
-                    full_text = cleaned
-                    break
-            if not full_text:
-                full_text = strip_think_tags(" ".join(c for c in candidates if c))
-        except Exception:
-            return None
 
         print(f"[PositionAI] raw [{symbol}]: {full_text[:200]}")
         if not full_text.strip():
