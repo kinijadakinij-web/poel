@@ -432,8 +432,6 @@ function drawPoster(
   const statDefs = [
     { label: "CURRENT",     val: (_cur != null && _cur > 0) ? `$${smartFmt(_cur)}` : "—", c: "#93c5fd" },
     { label: "ENTRY",       val: (_entry != null && _entry > 0) ? `$${smartFmt(_entry)}` : "—", c: "#e2e8f0" },
-    { label: "TAKE PROFIT", val: (_tp != null && _tp > 0) ? `$${smartFmt(_tp)}` : "—", c: "#86efac" },
-    { label: "STOP LOSS",   val: (_sl != null && _sl > 0) ? `$${smartFmt(_sl)}` : "—", c: "#fca5a5" },
   ];
   const gap2 = 7;
   const cW = (W - 56 - gap2 * (statDefs.length - 1)) / statDefs.length;
@@ -1172,8 +1170,6 @@ function PosterModal({
             <div className="border-t border-white/[0.06] pt-4 flex flex-col gap-2 text-[11px] font-mono">
               {[
                 { label: "Entry", val: signal.entry, color: "text-white" },
-                { label: "TP", val: signal.tp, color: "text-[#4ade80]" },
-                { label: "SL", val: signal.sl, color: "text-[#f87171]" },
               ].map((row) => (
                 <div key={row.label} className="flex justify-between text-white/40">
                   <span>{row.label}</span>
