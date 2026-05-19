@@ -74,6 +74,6 @@ async def root():
     return {"status": "ok", "message": "Sonnet Trading Bot API"}
 
 
-@app.get("/health")
+@app.get("/api/health")
 async def health():
     return {"status": "healthy"}
