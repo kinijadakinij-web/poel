@@ -206,11 +206,11 @@ async def _send_stream(
             "models": [QWEN_MODEL],
             "chat_type": "t2t",
             "feature_config": {
-                "thinking_enabled": False,
+                "thinking_enabled": True,
                 "output_schema": "phase",
                 "research_mode": "normal",
-                "auto_thinking": False,
-                "thinking_mode": "disabled",
+                "auto_thinking": True,
+                "thinking_mode": "enabled",
                 "thinking_format": "summary",
                 "auto_search": False,
             },
@@ -223,6 +223,7 @@ async def _send_stream(
 
     headers = {**_qwen_headers(token, chat_id), "x-accel-buffering": "no"}
     full_reply = ""
+    full_thoughts = []
 
     try:
         async with client.stream(
@@ -258,10 +259,26 @@ async def _send_stream(
                     continue
                 delta = choices[0].get("delta", {})
                 content_chunk = delta.get("content", "")
+                phase = delta.get("phase", "")
+                extra = delta.get("extra", {})
                 status = delta.get("status", "")
-                if content_chunk:
+                finish_reason = choices[0].get("finish_reason", "")
+
+                if phase == "thinking_summary":
+                    # Accumulate thinking summary — final entry is the complete thought
+                    thoughts = extra.get("summary_thought", {}).get("content", [])
+                    if thoughts:
+                        full_thoughts = thoughts
+                    if status == "finished":
+                        # Use the last (most complete) thought as the final reply
+                        if full_thoughts:
+                            full_reply = full_thoughts[-1].strip()
+                        break
+                elif content_chunk:
+                    # Fallback: streaming content chunks (non-thinking mode)
                     full_reply += content_chunk
-                if status == "finished":
+
+                if finish_reason == "stop":
                     break
     except Exception as e:
         logger.warning(f"[qwen] _send_stream error: {e}")
