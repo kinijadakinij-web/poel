@@ -28,7 +28,10 @@ import base64
 import io
 import json
 import logging
+import mimetypes
 import os
+import time
+import uuid
 from typing import Dict, List, Optional
 
 import httpx
@@ -40,19 +43,230 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Config (Railway env vars)
 # ---------------------------------------------------------------------------
-_GATEWAY_RAW = os.getenv("QWEN_BASE_URL", "https://qwen-web-gateway.onrender.com").strip().rstrip("/")
-# Auto-fix missing protocol — common Railway misconfiguration
-if _GATEWAY_RAW and not _GATEWAY_RAW.startswith(("http://", "https://")):
-    _GATEWAY_RAW = "https://" + _GATEWAY_RAW
-_GATEWAY = _GATEWAY_RAW or "https://qwen-web-gateway.onrender.com"
+BASE_URL = "https://chat.qwen.ai"
 
 QWEN_MODEL = os.getenv("QWEN_MODEL", "").strip() or "qwen3.6-plus"
 QWEN_THINKING = os.getenv("QWEN_THINKING_MODE", "").strip() or "Thinking"
 
-CHAT_URL = f"{_GATEWAY}/v1/openai/chat/completions"
-REFRESH_URL = f"{_GATEWAY}/v1/refresh"
-print(f"🌐 qwen_ai: gateway = {_GATEWAY}")
+# Kept for backward compatibility (position_ai.py may import these)
+CHAT_URL = BASE_URL
+REFRESH_URL = ""  # not used with reverse API
+
+print(f"🌐 qwen_ai: direct reverse API → {BASE_URL}")
 print(f"[qwen_ai] model={QWEN_MODEL!r} thinking={QWEN_THINKING!r}")
+
+
+# ---------------------------------------------------------------------------
+# Reverse API helpers — direct calls to chat.qwen.ai
+# ---------------------------------------------------------------------------
+
+def _qwen_headers(token: str, chat_id: str = None) -> dict:
+    h = {
+        "Accept": "application/json",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Content-Type": "application/json",
+        "source": "web",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/147.0.0.0 Safari/537.36"
+        ),
+        "Origin": "https://chat.qwen.ai",
+        "Version": "0.2.7",
+        "bx-v": "2.5.36",
+        "Authorization": f"Bearer {token}",
+        "X-Request-Id": str(uuid.uuid4()),
+    }
+    if chat_id:
+        h["Referer"] = f"https://chat.qwen.ai/c/{chat_id}"
+    return h
+
+
+async def _create_chat(token: str, client: "httpx.AsyncClient") -> Optional[str]:
+    try:
+        resp = await client.post(
+            f"{BASE_URL}/api/v2/chats/new",
+            headers=_qwen_headers(token),
+            json={
+                "title": "AI Analysis",
+                "models": [QWEN_MODEL],
+                "chat_mode": "normal",
+                "chat_type": "t2t",
+                "timestamp": int(time.time() * 1000),
+                "project_id": "",
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json()["data"]["id"]
+    except Exception as e:
+        logger.warning(f"[qwen] _create_chat failed: {e}")
+        return None
+
+
+async def _delete_chat(token: str, chat_id: str, client: "httpx.AsyncClient"):
+    try:
+        await client.delete(
+            f"{BASE_URL}/api/v2/chats/{chat_id}",
+            headers=_qwen_headers(token),
+            timeout=15,
+        )
+    except Exception:
+        pass
+
+
+async def _upload_image_bytes(
+    token: str,
+    image_bytes: bytes,
+    filename: str,
+    mime_type: str,
+    client: "httpx.AsyncClient",
+) -> Optional[dict]:
+    """Upload image bytes to Qwen OSS. Returns dict with file_url, file_id, filename."""
+    try:
+        import oss2
+    except ImportError:
+        logger.warning("[qwen] oss2 not installed — image upload skipped (pip install oss2)")
+        return None
+
+    filetype = mime_type.split("/")[0]
+    try:
+        resp = await client.post(
+            f"{BASE_URL}/api/v1/files/getstsToken",
+            headers=_qwen_headers(token),
+            json={"filename": filename, "filesize": len(image_bytes), "filetype": filetype},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        d = resp.json()
+    except Exception as e:
+        logger.warning(f"[qwen] STS token request failed: {e}")
+        return None
+
+    try:
+        auth = oss2.StsAuth(d["access_key_id"], d["access_key_secret"], d["security_token"])
+        bucket = oss2.Bucket(auth, f"https://{d['region']}.aliyuncs.com", d["bucketname"])
+        result = bucket.put_object(d["file_path"], image_bytes, headers={"Content-Type": mime_type})
+        if result.status != 200:
+            logger.warning(f"[qwen] OSS upload failed: {result.status}")
+            return None
+    except Exception as e:
+        logger.warning(f"[qwen] OSS upload error: {e}")
+        return None
+
+    return {
+        "file_url": d["file_url"],
+        "file_id": d.get("file_id", ""),
+        "filename": filename,
+        "mime_type": mime_type,
+    }
+
+
+async def _send_stream(
+    token: str,
+    chat_id: str,
+    prompt: str,
+    client: "httpx.AsyncClient",
+    files: list = None,
+) -> str:
+    """Send a message via reverse API and return the full streamed reply."""
+    fid = str(uuid.uuid4())
+    child_id = str(uuid.uuid4())
+    ts = int(time.time())
+
+    msg_files = []
+    if files:
+        for f in files:
+            msg_files.append({
+                "type": f["mime_type"].split("/")[0],
+                "name": f["filename"],
+                "url": f["file_url"],
+                "file_id": f["file_id"],
+                "size": 0,
+                "file_type": f["mime_type"],
+            })
+
+    payload = {
+        "stream": True,
+        "version": "2.1",
+        "incremental_output": True,
+        "chat_id": chat_id,
+        "chat_mode": "normal",
+        "model": QWEN_MODEL,
+        "parent_id": None,
+        "messages": [{
+            "fid": fid,
+            "parentId": None,
+            "childrenIds": [child_id],
+            "role": "user",
+            "content": prompt,
+            "user_action": "chat",
+            "files": msg_files,
+            "timestamp": ts,
+            "models": [QWEN_MODEL],
+            "chat_type": "t2t",
+            "feature_config": {
+                "thinking_enabled": False,
+                "output_schema": "phase",
+                "research_mode": "normal",
+                "auto_thinking": False,
+                "thinking_mode": "disabled",
+                "thinking_format": "summary",
+                "auto_search": False,
+            },
+            "extra": {"meta": {"subChatType": "t2t"}},
+            "sub_chat_type": "t2t",
+            "parent_id": None,
+        }],
+        "timestamp": ts + 1,
+    }
+
+    headers = {**_qwen_headers(token, chat_id), "x-accel-buffering": "no"}
+    full_reply = ""
+
+    try:
+        async with client.stream(
+            "POST",
+            f"{BASE_URL}/api/v2/chat/completions?chat_id={chat_id}",
+            headers=headers,
+            json=payload,
+            timeout=180,
+        ) as resp:
+            if resp.status_code != 200:
+                body = await resp.aread()
+                logger.warning(f"[qwen] _send_stream HTTP {resp.status_code}: {body.decode()[:300]}")
+                return ""
+
+            async for line in resp.aiter_lines():
+                if not line:
+                    continue
+                data_str = line[6:] if line.startswith("data: ") else line
+                if data_str.strip() == "[DONE]":
+                    break
+                try:
+                    data = json.loads(data_str)
+                except Exception:
+                    continue
+
+                if data.get("success") is False:
+                    err = data.get("data", {})
+                    logger.warning(f"[qwen] API error: {err.get('code')} — {err.get('details')}")
+                    break
+
+                choices = data.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta", {})
+                content_chunk = delta.get("content", "")
+                status = delta.get("status", "")
+                if content_chunk:
+                    full_reply += content_chunk
+                if status == "finished":
+                    break
+    except Exception as e:
+        logger.warning(f"[qwen] _send_stream error: {e}")
+
+    return full_reply
 
 # ---------------------------------------------------------------------------
 # Training images — loaded once at startup from services/ directory
@@ -345,23 +559,7 @@ class QwenAIClient:
         self.client = httpx.AsyncClient(timeout=240)
 
     async def _refresh(self) -> bool:
-        """Ask the gateway to silently renew the session token."""
-        try:
-            resp = await self.client.get(
-                REFRESH_URL,
-                headers={"Authorization": f"Bearer {self.token}"},
-                timeout=30,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                new_token = data.get("token") or data.get("access_token") or data.get("data", {}).get("token")
-                if new_token:
-                    self.token = new_token
-                    logger.info(f"{self._tag} Token refreshed ✅")
-                    print(f"{self._tag} ✅ Token refreshed successfully")
-                    return True
-        except Exception as e:
-            logger.warning(f"{self._tag} Token refresh failed: {e}")
+        """Token refresh not applicable with reverse API."""
         return False
 
     async def analyze(
@@ -507,161 +705,60 @@ TP RULES:
 
 If there is NO clear void/imbalance setup → return "NO TRADE". Do NOT force a trade."""
 
-        # ── 3. Compose message ───────────
-        content = []
-
-        # Training images first — gives AI visual reference for the strategy
+        # ── 3. Upload images to Qwen OSS ────────────────────────────
+        uploaded_files = []
         if _TRAINING_IMAGES:
-            content.append({
-                "type": "text",
-                "text": (
-                    f"━━━ TRAINING REFERENCE CHARTS ({len(_TRAINING_IMAGES)} images) ━━━\n"
-                    "The following images are REAL TRADE EXAMPLES from the strategy you must replicate.\n"
-                    "Study the void/wick patterns in these charts — then apply the SAME logic to the live charts below."
-                ),
-            })
-            for img_b64 in _TRAINING_IMAGES:
-                content.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
-                })
-            content.append({
-                "type": "text",
-                "text": "━━━ END OF TRAINING REFERENCE ━━━\nNow analyze the LIVE charts below:",
-            })
+            print(f"{tag} 📤 Uploading {len(_TRAINING_IMAGES)} training image(s) for {symbol}...")
+            for i, img_b64 in enumerate(_TRAINING_IMAGES):
+                uf = await _upload_image_bytes(
+                    self.token, base64.b64decode(img_b64),
+                    f"training{i + 1}.jpg", "image/jpeg", self.client,
+                )
+                if uf:
+                    uploaded_files.append(uf)
+        for tf, img_b64 in charts.items():
+            uf = await _upload_image_bytes(
+                self.token, base64.b64decode(img_b64),
+                f"chart_{symbol}_{tf}.png", "image/png", self.client,
+            )
+            if uf:
+                uploaded_files.append(uf)
+        if uploaded_files:
+            print(f"{tag} 📷 {len(uploaded_files)} image(s) uploaded for {symbol}")
 
-        # Live candlestick charts per timeframe
-        for tf in ["5m", "15m", "30m", "1h", "4h"]:
-            if tf in charts:
-                content.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/png;base64,{charts[tf]}"},
-                })
-        content.append({"type": "text", "text": prompt_text})
+        # Prepend system prompt (reverse API has no dedicated system field)
+        full_prompt = SYSTEM_PROMPT + "\n\n---\n\n" + prompt_text
 
-        # ── 4. Call Qwen API ─────────
-        payload = {
-            "model": QWEN_MODEL,
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": content},
-            ],
-            "stream": False,
-            "thinking_mode": QWEN_THINKING,
-            "max_tokens": 2500,
-        }
-
-        data = None
+        # ── 4. Create chat, stream response, cleanup ─────────────────
+        full_text = ""
         lock = ai_lock()
         async with lock:
             for attempt in range(2):
                 try:
-                    print(f"{tag} 🔄 Qwen request [{QWEN_MODEL}] for {symbol} (attempt {attempt + 1})")
-                    resp = await self.client.post(
-                        CHAT_URL,
-                        headers={
-                            "Authorization": f"Bearer {self.token}",
-                            "Content-Type": "application/json",
-                        },
-                        json=payload,
-                        timeout=180,
-                    )
-
-                    if resp.status_code == 401:
-                        logger.warning(f"{tag} 401 Unauthorized for {symbol} — trying token refresh")
-                        print(f"{tag} 🔑 Token expired — refreshing...")
-                        if attempt == 0 and await self._refresh():
+                    print(f"{tag} 🔄 Qwen reverse API [{QWEN_MODEL}] for {symbol} (attempt {attempt + 1})")
+                    chat_id = await _create_chat(self.token, self.client)
+                    if not chat_id:
+                        if attempt == 0:
                             continue
-                        return self._no_trade("Auth failed (401) even after refresh")
+                        return self._no_trade("Failed to create chat session")
 
-                    if resp.status_code == 429:
-                        logger.warning(f"{tag} 429 Rate-limited for {symbol}")
-                        self.exhausted = True
-                        print(f"{tag} 🚫 Token slot {self.slot} rate-limited (429) — marked exhausted")
-                        return self._no_trade("RateLimited:429")
+                    raw_reply = await _send_stream(
+                        self.token, chat_id, full_prompt, self.client, uploaded_files or None
+                    )
+                    await _delete_chat(self.token, chat_id, self.client)
 
-                    if resp.status_code == 502:
-                        try:
-                            err = resp.json().get("error", {})
-                            code = err.get("code", "")
-                            detail = err.get("details", "") or err.get("message", "")
-                        except Exception:
-                            code, detail = "", ""
-                        if code == "RateLimited" or "upper limit" in detail.lower() or "usage" in detail.lower():
-                            self.exhausted = True
-                            print(f"{tag} 🚫 Token slot {self.slot} daily limit reached — marked exhausted")
-                            return self._no_trade("RateLimited:daily")
-                        if code == "image_upload_failed":
-                            print(f"{tag} ⚠️ Image upload failed for {symbol} — NO TRADE")
-                            return self._no_trade("HTTP 502: image_upload_failed")
-                        logger.error(f"{tag} HTTP 502 for {symbol}: {resp.text[:400]}")
-                        return self._no_trade("HTTP 502: gateway error")
+                    if raw_reply:
+                        import re
+                        full_text = re.sub(r"<think>.*?</think>", "", raw_reply, flags=re.DOTALL).strip()
+                        break
 
-                    if resp.status_code != 200:
-                        logger.error(f"{tag} HTTP {resp.status_code} for {symbol}: {resp.text[:400]}")
-                        return self._no_trade(f"HTTP {resp.status_code}")
+                    if attempt == 0:
+                        continue
+                    return self._no_trade("Empty stream response after retries")
 
-                    data = resp.json()
-                    break
-
-                except httpx.TimeoutException:
-                    logger.error(f"{tag} Timeout for {symbol}")
-                    return self._no_trade("Request timeout (180s)")
                 except Exception as e:
                     logger.error(f"{tag} Request exception for {symbol}: {e}", exc_info=True)
                     return self._no_trade(f"Request error: {e}")
-
-        if data is None:
-            return self._no_trade("No response after retries")
-
-        # ── 5. Extract response text ──────────────────────────────────
-        # Qwen thinking mode returns content in multiple possible locations:
-        # 1. choices[0].message.content          — normal / fast mode
-        # 2. choices[0].message.reasoning_content — thinking mode (reasoning)
-        # 3. content may contain <think>...</think> wrapping the actual JSON
-        # Strategy: try all locations, strip <think> tags, find the JSON block
-        try:
-            message = data.get("choices", [{}])[0].get("message", {})
-
-            # Collect all text candidates
-            # NOTE: use msg_content to avoid shadowing the payload `content` list built above
-            msg_content = message.get("content") or ""
-            reasoning = message.get("reasoning_content") or ""
-            # Some gateway versions use these keys
-            think_content = message.get("think_content") or ""
-            answer_content = message.get("answer_content") or ""
-
-            candidates = [msg_content, answer_content, reasoning, think_content]
-
-            # Log raw structure for debugging
-            print(f"{tag} DEBUG [{symbol}] message keys: {list(message.keys())}")
-            print(f"{tag} DEBUG content={len(msg_content)}ch reasoning={len(reasoning)}ch answer={len(answer_content)}ch")
-
-            # Remove <think>...</think> blocks — they contain reasoning, not JSON
-            import re
-            def strip_think_tags(text: str) -> str:
-                # Remove full <think>...</think> blocks
-                cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-                return cleaned
-
-            full_text = ""
-            for candidate in candidates:
-                if not candidate:
-                    continue
-                cleaned = strip_think_tags(candidate)
-                # Check if this candidate contains a JSON block
-                if "{" in cleaned and "}" in cleaned:
-                    full_text = cleaned
-                    break
-
-            # Fallback: concatenate all and try to find JSON anywhere
-            if not full_text:
-                combined = " ".join(c for c in candidates if c)
-                full_text = strip_think_tags(combined)
-
-        except Exception as e:
-            logger.error(f"{tag} Content extraction error for {symbol}: {e}")
-            return self._no_trade("Failed to extract response content")
 
         logger.info(f"{tag} Raw response for {symbol} ({len(full_text)} chars):\n{full_text[:600]}")
         print(f"{tag} RAW [{symbol}]: {full_text[:400]}")
