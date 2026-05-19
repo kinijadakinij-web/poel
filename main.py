@@ -10,6 +10,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from services.database import init_db
+from services.auth_service import seed_admin
 from services.mexc_price_feed import price_feed
 from routes.auth_routes import router as auth_router
 from routes.bot import router as bot_router
@@ -31,6 +32,9 @@ async def lifespan(app: FastAPI):
     logger.info("🚀 Starting up...")
     init_db()
     logger.info("✅ Database initialized")
+
+    seed_admin()
+    logger.info("✅ Admin seeded")
 
     asyncio.create_task(price_feed.start())
     logger.info("✅ MEXC price feed started")
