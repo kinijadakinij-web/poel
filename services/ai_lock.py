@@ -1,13 +1,16 @@
 """
-Shared AI request lock.
+Shared AI request lock — digunakan oleh position_ai (monitor).
 
-Karena gateway hanya bisa handle 1 request sekaligus,
-semua AI call (analysis + monitor) harus antri via lock ini.
+qwen_ai (scanner) TIDAK lagi menggunakan lock global ini.
+Setiap QwenAIClient kini punya per-instance lock sendiri,
+sehingga 3 token bisa berjalan paralel sekaligus.
 
-Usage:
+position_ai tetap pakai lock ini karena masih single-client.
+
+Usage (position_ai):
     from services.ai_lock import ai_lock
 
-    async with ai_lock:
+    async with ai_lock():
         resp = await client.post(...)
 """
 
