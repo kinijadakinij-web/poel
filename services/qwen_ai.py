@@ -572,6 +572,15 @@ class QwenAIClient:
         self._tag = f"[QW-{slot}]"
         self.exhausted = False  # True kalau kena rate limit harian
         self.client = httpx.AsyncClient(timeout=240)
+        # Per-instance lock — memastikan 1 token tidak dipakai 2 request bersamaan,
+        # tapi token BERBEDA bisa jalan paralel tanpa saling blokir.
+        self._lock: asyncio.Lock | None = None
+
+    def _get_lock(self) -> asyncio.Lock:
+        """Lazy-init per-client lock (harus dibuat di dalam running event loop)."""
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
     async def _refresh(self) -> bool:
         """Token refresh not applicable with reverse API."""
@@ -766,9 +775,9 @@ If there is NO clear void/imbalance setup → return "NO TRADE". Do NOT force a 
         full_prompt = SYSTEM_PROMPT + "\n\n---\n\n" + prompt_text
 
         # ── 4. Create chat, stream response, cleanup ─────────────────
+        # Gunakan per-client lock supaya token berbeda bisa jalan paralel.
         full_text = ""
-        lock = ai_lock()
-        async with lock:
+        async with self._get_lock():
             for attempt in range(2):
                 try:
                     print(f"{tag} 🔄 Qwen reverse API [{QWEN_MODEL}] for {symbol} (attempt {attempt + 1})")
@@ -953,6 +962,83 @@ class ParallelQwenAI:
         client = self._current_client()
         slot = client.slot if client else "?"
         print(f"[QwenAI] 🔄 Token rotated → slot {slot} | reason: {reason}")
+
+    async def analyze_parallel(self, items: list, concurrency: int = 3) -> list:
+        """
+        Analisis beberapa simbol secara PARALEL — masing-masing pakai token berbeda.
+
+        items: list of tuples (symbol, candles_by_tf, current_price, backend_context)
+               — current_price dan backend_context boleh None.
+        concurrency: jumlah token paralel (default 3, max = jumlah token tersedia).
+
+        Return: list hasil dalam urutan yang sama dengan items.
+
+        Cara kerja:
+          - Item ke-0 → token ke-0, item ke-1 → token ke-1, dst.
+          - Kalau items > concurrency, item sisanya diproses di batch berikutnya
+            (caller bertanggung jawab membatasi jumlah items).
+          - Kalau suatu token dapat 502/RateLimited, rotate dan retry sekali.
+        """
+        if not self.clients:
+            return [self._no_trade("No tokens configured")] * len(items)
+
+        available = self._available_clients()
+        n = min(len(items), concurrency, len(available))
+
+        if n == 0:
+            return [self._no_trade("No tokens available")] * len(items)
+
+        print(
+            f"[QwenAI] analyze_parallel: {len(items)} symbol(s) → "
+            f"{n} parallel slot(s) | tokens: {[available[i % len(available)].slot for i in range(n)]}"
+        )
+
+        # Dispatch setiap item ke token berbeda
+        tasks = []
+        for i, item in enumerate(items[:n]):
+            sym   = item[0]
+            tfs   = item[1]
+            price = item[2] if len(item) > 2 else None
+            bctx  = item[3] if len(item) > 3 else None
+            client = available[i % len(available)]
+            tasks.append(self._analyze_with_client(client, sym, tfs, price, bctx))
+
+        gathered = await asyncio.gather(*tasks, return_exceptions=True)
+
+        final = []
+        for r in gathered:
+            if isinstance(r, Exception):
+                final.append(self._no_trade(f"Task exception: {r}"))
+            elif isinstance(r, dict):
+                final.append(r)
+            else:
+                final.append(self._no_trade(str(r)))
+
+        # Items di luar concurrency limit (harusnya tidak ada kalau caller membatasi batch)
+        for item in items[n:]:
+            final.append(self._no_trade("Skipped — beyond concurrency limit"))
+
+        return final
+
+    async def _analyze_with_client(
+        self,
+        client: "QwenAIClient",
+        symbol: str,
+        candles_by_tf: dict,
+        current_price: float = None,
+        backend_context: dict = None,
+    ) -> dict:
+        """Analisis satu simbol dengan client tertentu; rotate+retry kalau 502/RateLimited."""
+        result = await client.analyze(symbol, candles_by_tf, current_price, backend_context)
+
+        if self._should_rotate(result.get("reason", "")):
+            self._rotate(result["reason"])
+            retry = self._current_client()
+            if retry and retry is not client:
+                print(f"[QwenAI] Retry {symbol} → slot {retry.slot}")
+                result = await retry.analyze(symbol, candles_by_tf, current_price, backend_context)
+
+        return result
 
     async def analyze_batch(self, items: list) -> list:
         """
