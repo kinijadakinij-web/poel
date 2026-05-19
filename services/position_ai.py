@@ -122,6 +122,69 @@ Reason: Most limit/void entries experience an initial fakeout or retrace before
 moving to target. This is normal. The first 5 minutes are the highest-noise window.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+UNREALIZED PnL / ROE IS NOT STRUCTURAL INVALIDATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+HIGH LEVERAGE AMPLIFIES NORMAL PRICE MOVEMENT.
+With 50x leverage:
+  - Price moves 0.1%  → ROE moves ±5%
+  - Price moves 0.06% → ROE moves ±3%
+
+This means a -5% ROE can be caused by a price move of only -0.1%.
+That is NOISE. That is NOT a reason to CLOSE.
+
+RULE: Do NOT use ROE or Unrealized PnL alone as evidence for CLOSE.
+  → Focus on PRICE DISTANCE FROM ENTRY (shown in the status block) — that is the real market move.
+  → A negative ROE that corresponds to a small price distance (< 0.20% from entry) is NORMAL VOLATILITY.
+  → CLOSE decisions must be based on PRICE STRUCTURE, not leveraged PnL emotions.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ENTRY NOISE ZONE (CRITICAL)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+If ENTRY NOISE ZONE = TRUE (price is within ±0.15% of entry price):
+  → This is NORMAL ENTRY ROTATION. Futures markets routinely sweep liquidity at entry before moving.
+  → CLOSE is FORBIDDEN unless: SL is nearly hit OR 15m+ HTF structure is clearly invalidated.
+  → Apply MAXIMUM HOLD BIAS. Do not be scared by leveraged PnL in this zone.
+  → Micro breaks, delta flips, and ADX drops inside this zone are ALL NOISE.
+
+Reason: limit/void/imbalance entries almost always experience initial rotation before the move begins.
+Being shaken out of a valid setup during entry rotation is the most common avoidable loss.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+HOLD CONFIDENCE DECAY (TIME-BASED BIAS)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Position age determines your default HOLD strength:
+
+  0–5 minutes:   MAXIMUM HOLD BIAS — almost nothing justifies CLOSE except SL nearly hit or 15m+ HTF break
+  5–15 minutes:  STRONG HOLD BIAS — need clear HTF confirmation for CLOSE; LTF signals still insufficient
+  15–60 minutes: NORMAL MONITORING — standard multi-confirmation rules apply for CLOSE
+  60m+:          STRUCTURE FOCUS — HTF structure and thesis score are primary; can consider SL+ more freely
+
+Reason: new trades are always the noisiest. Patience in the first 5–15 minutes protects the edge.
+Over-evaluating a fresh entry leads to systematic overreaction. Most profitable systems trade LESS, not more.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SIGNAL HIERARCHY — WEIGHT SIGNALS CORRECTLY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TIER 1 — HARD TRUTH (these drive CLOSE decisions):
+  • HTF structure break (15m/1H/4H higher_low or lower_high violated)
+  • thesis_score (primary health indicator of the trade)
+  • abnormal_move = true on 15m+ (price truly outside normal ATR range)
+
+TIER 2 — CONTEXT (adds weight, never decides alone):
+  • CVD divergence on 15m+ (sustained, not 1m flip)
+  • ADX / momentum on 15m+
+  • Session (Asia thin, NY/London expansion)
+
+TIER 3 — NOISE (do not overweight these):
+  • 1m / 3m delta flip
+  • micro_break on 1m or 3m
+  • Tiny reversal candles on LTF
+  • ROE / Unrealized PnL (leverage-amplified)
+
+You are a discretionary trader. Focus on 2–4 signals max. Combining too many Tier 3 signals
+does NOT make a CLOSE — it just means the market is breathing normally.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 MICRO REVERSALS ARE NORMAL — DO NOT PANIC
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Small timeframe reversals immediately after entry are EXPECTED market behavior.
@@ -135,6 +198,7 @@ Do NOT CLOSE because of:
   - A temporary delta flip on 1m or 3m
   - One or two bearish/bullish impulse candles against the position
   - ADX dropping after entry (consolidation is normal)
+  - Negative ROE when price is still close to entry (this is leverage amplification, not invalidation)
   - Price slightly below/above entry (still within normal retrace range)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -345,6 +409,30 @@ class PositionAIClient:
         sign = "+" if pnl_pct >= 0 else ""
         pnl_icon = "🟢" if pnl_pct >= 0 else "🔴"
 
+        # ── Price distance from entry (real market move, not leverage-amplified) ──
+        price_distance_pct = round((current_price - entry) / entry * 100, 4)  # signed, no leverage
+        price_distance_abs = abs(price_distance_pct)
+        entry_noise_zone = price_distance_abs < 0.15  # within ±0.15% = normal entry rotation
+        price_dist_sign = "+" if price_distance_pct >= 0 else ""
+        price_dist_icon = "🟢" if price_distance_pct >= 0 else "🔴"
+
+        # ── Position age in minutes ───────────────────────────────────────────────
+        position_age_min: float = 0.0
+        if opened_at:
+            try:
+                position_age_min = (time.time() - opened_at / 1000) / 60
+            except Exception:
+                position_age_min = 0.0
+
+        if position_age_min < 5:
+            age_bias = "MAXIMUM HOLD BIAS (< 5 min — highest noise window)"
+        elif position_age_min < 15:
+            age_bias = "STRONG HOLD BIAS (5–15 min — still early, LTF noise expected)"
+        elif position_age_min < 60:
+            age_bias = "NORMAL MONITORING (15–60 min — standard rules apply)"
+        else:
+            age_bias = "STRUCTURE FOCUS (60m+ — HTF structure and thesis are primary)"
+
         # ── Check TP1 hit condition ──────────────────────────────────
         tp1_hit = False
         if tp1 is not None and tp1 > 0:
@@ -490,6 +578,12 @@ class PositionAIClient:
                 lines.append(f"{c[0]}, {c[1]}, {c[2]}, {c[3]}, {c[4]}, {c[5]}")
             ohlcv_blocks.append("\n".join(lines))
 
+        noise_zone_line = (
+            f" ⚠️  ENTRY NOISE ZONE: YES — price within ±0.15% of entry → MAXIMUM HOLD BIAS, do NOT close\n"
+            if entry_noise_zone else
+            f" ENTRY NOISE ZONE: NO — price has moved beyond ±0.15% from entry\n"
+        )
+
         user_text = (
             f"ACTIVE POSITION — HOLD, CLOSE, or SL+?\n"
             f"{time_block}"
@@ -501,19 +595,33 @@ class PositionAIClient:
             f" Direction: {direction}\n"
             f" Entry: {entry}\n"
             f" Current Price: {current_price}\n"
+            f"\n"
+            f" ── REAL MARKET MOVE (not leverage-amplified) ──\n"
+            f" {price_dist_icon} Price Distance from Entry: {price_dist_sign}{price_distance_pct}%\n"
+            f"   → Actual price moved {price_dist_sign}{price_distance_pct}% from entry\n"
+            f"{noise_zone_line}"
+            f"\n"
+            f" ── LEVERAGED PnL (for reference only — NOT a trade decision signal) ──\n"
+            f" {pnl_icon} Unrealized ROE: {sign}{pnl_pct}% ({sign}{pnl_usdt} USDT) [{leverage}x leverage]\n"
+            f"   ⚠ ROE amplifies real price move by {leverage}x. Do NOT use ROE alone to justify CLOSE.\n"
+            f"\n"
             f" Take Profit: {tp} ({pct_to_tp:+.3f}% away)\n"
             f" Stop Loss: {sl} (-{pct_to_sl:.3f}% away)\n"
             f" TP1 Level: {tp1 if tp1 else 'N/A'}\n"
             f" TP1 Hit: {'YES ✅' if tp1_hit else 'NO'}\n"
-            f" {pnl_icon} Unrealized PnL: {sign}{pnl_pct}% ({sign}{pnl_usdt} USDT)\n"
-            f" Leverage: {leverage}x\n"
-            f" Margin Used: {margin_usdt} USDT\n"
+            f" Leverage: {leverage}x | Margin: {margin_usdt} USDT\n"
+            f"\n"
+            f" ── HOLD BIAS (based on position age) ──\n"
+            f" ⏱ Position Age: {elapsed_str} ({position_age_min:.1f} min)\n"
+            f" 🎯 Current Bias: {age_bias}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"{pctx_block}"
             f"{chr(10).join(ohlcv_blocks)}\n\n"
             f"Charts attached above.\n"
             f"Remember: this position was opened {elapsed_str}. "
-            f"Judge whether the ORIGINAL HTF THESIS is still valid — NOT just current price.\n"
+            f"Judge whether the ORIGINAL HTF THESIS is still valid — focus on PRICE STRUCTURE, not ROE.\n"
+            f"PRICE DISTANCE from entry = {price_dist_sign}{price_distance_pct}% (real move). "
+            f"ROE = {sign}{pnl_pct}% (leverage-amplified, treat as noise unless price has truly moved).\n"
             f"LTF (1m/3m) noise, micro_break, or delta flip alone is NOT enough to CLOSE.\n"
             f"CLOSE requires multiple HTF confirmations. DEFAULT = HOLD. When in doubt → HOLD.\n"
             f"If TP1 has been HIT and position is in PROFIT → return SL+ to lock gains.\n"
