@@ -5,6 +5,7 @@ import "katex/dist/katex.min.css";
 import "./globals.css";
 import { TradingProvider } from "@/hooks/useTradingContext";
 import { AuthProvider } from "@/hooks/useAuthContext";
+import { ToastProvider } from "@/components/ui/Toast";
 import SmoothScroll from "@/components/SmoothScroll";
 import CustomCursor from "@/components/ui/CustomCursor";
 import TradingNav from "@/components/ui/TradingNav";
@@ -25,10 +26,13 @@ export default function RootLayout({
         <CustomCursor />
         <AuthProvider>
           <TradingProvider>
-            <SmoothScroll>
-              <TradingNav />
-              {children}
-            </SmoothScroll>
+            {/* ToastProvider wraps everything so useToast() works everywhere */}
+            <ToastProvider>
+              <SmoothScroll>
+                <TradingNav />
+                {children}
+              </SmoothScroll>
+            </ToastProvider>
           </TradingProvider>
         </AuthProvider>
       </body>
