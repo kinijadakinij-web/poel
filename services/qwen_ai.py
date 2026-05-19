@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 BASE_URL = "https://chat.qwen.ai"
 
-QWEN_MODEL = os.getenv("QWEN_MODEL", "").strip() or "qwen3.6-plus"
+QWEN_MODEL = os.getenv("QWEN_MODEL", "").strip() or "qwen-latest-series-invite-beta-v24"
 QWEN_THINKING = os.getenv("QWEN_THINKING_MODE", "").strip() or "Thinking"
 
 # Kept for backward compatibility (position_ai.py may import these)
