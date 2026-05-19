@@ -8,11 +8,15 @@ Features:
  • Retry terus sampai dapat HOLD/CLOSE/SL+ yang valid
  • Menyertakan opened_at, original_prompt, dan original_ai_response
  • SL+ enhanced: trigger SL+ ketika TP1 sudah tercapai dan PnL positif
+ • ENTRY NOISE ZONE + HOLD CONFIDENCE DECAY — mencegah close premature
+ • Signal hierarchy (Tier1/2/3) agar tidak overloaded noise
 
 Env vars:
  MONITOR_TOKEN_1..5 — bearer token khusus monitor (opsional)
  (kalau tidak diset, fallback ke QWEN_TOKEN_1..5 dari token_manager)
  MONITOR_INTERVAL_SECONDS — seberapa sering query per posisi (default: 120s)
+ ENTRY_NOISE_ZONE_PCT — batas persen harga dari entry yang dianggap noise (default 0.15)
+ MIN_HOLD_TIME_SECONDS — waktu minimal sebelum boleh close (default 300 = 5 menit)
  QWEN_BASE_URL / QWEN_MODEL / QWEN_THINKING_MODE — shared dengan qwen_ai.py
 """
 
@@ -45,6 +49,11 @@ from services.token_manager import token_manager
 
 MONITOR_INTERVAL = int(os.getenv("MONITOR_INTERVAL_SECONDS", "120"))
 
+# Entry noise zone (% dari entry price). Harga bergerak dalam zone ini dianggap normal.
+ENTRY_NOISE_ZONE_PCT = float(os.getenv("ENTRY_NOISE_ZONE_PCT", "0.15"))  # 0.15%
+MIN_HOLD_TIME_SECONDS = int(os.getenv("MIN_HOLD_TIME_SECONDS", "300"))     # 5 menit
+
+
 def _load_monitor_tokens() -> list[str]:
     """
     Load token pool untuk PositionAI.
@@ -72,18 +81,17 @@ _tokens: list[str] = _load_monitor_tokens()
 
 
 # ---------------------------------------------------------------------------
-# System prompt — position management with SL+ addition
+# System prompt — position management with improved patience, noise zone, hierarchy
 # ---------------------------------------------------------------------------
 POSITION_SYSTEM_PROMPT = """You are a position management AI for a crypto futures trading bot.
 
-An ACTIVE OPEN POSITION is running — entry price has already been hit.
+AN ACTIVE OPEN POSITION is running — entry price has already been hit.
 You will receive:
  1. When the position was opened (OPENED AT)
  2. The exact prompt the analysis AI received when it decided to enter this trade
  3. The analysis AI's full response that justified the entry
  4. The current position status and latest candle data
- 5. Backend pre-computed context: Volume Delta/CVD, ADX momentum, swing structure,
-    liquidity sweep detection, session info, ATR pullback normalization, and thesis score
+ 5. Backend pre-computed context
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 DEFAULT BEHAVIOR — READ THIS FIRST
@@ -94,126 +102,61 @@ When in doubt between HOLD and CLOSE → choose HOLD.
 Early patience protects the edge. Premature exits destroy it.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-TIMEFRAME AUTHORITY RULE (CRITICAL)
+ENTRY NOISE ZONE (CRITICAL NEW RULE)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-The original trade thesis was built on a HIGHER TIMEFRAME (HTF) — typically 4H/1H structure.
-Execution may have been on a lower timeframe (15m/3m), but the thesis is HTF.
+If current price is within ±{ENTRY_NOISE_ZONE_PCT}% of entry price, this is considered
+NORMAL ENTRY ROTATION. In this zone:
+  → DO NOT CLOSE unless there is a CLEAR HTF structural invalidation
+  → DO NOT use small negative PnL, delta flips, or micro breaks as close signals
+  → HOLD is mandatory unless structural invalidation confirmed on 15m or higher timeframe
 
-RULE: CLOSE requires invalidation on the SAME or HIGHER timeframe as the original entry thesis.
-  → 1m or 3m reversal signals alone are NEVER sufficient to CLOSE.
-  → Lower timeframe signals (1m/3m) may justify SL+ or serve as WARNING only.
-  → A micro_break on 1m/3m is NOISE — not thesis invalidation.
-  → Only a structural break on 15m, 1H, or 4H can invalidate an HTF thesis.
-
-Crypto futures behavior: 1m–3m candles routinely fake-break, sweep liquidity, then reclaim.
-Do NOT treat a 1m micro_break the same as a 4H structure failure.
+Crypto futures often rotate, sweep liquidity, then move. Noise zone is not invalidation.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-MINIMUM HOLD TIME RULE
+UNREALIZED PNL / ROE IS NOT STRUCTURAL INVALIDATION
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-If position age < 5 minutes:
-  → CLOSE is NOT allowed unless:
-     a) Stop loss level is nearly hit (within 0.3% of SL)
-     b) abnormal_move = true on a 15m+ timeframe
-     c) HTF (15m or higher) structure is clearly invalidated
-  → For all other signals in the first 5 minutes → HOLD
+High leverage (50x) amplifies normal price movement.
+A small negative ROE (-5%) may represent a price move of only -0.1%.
+DO NOT use ROE/PnL alone as evidence for CLOSE.
+Focus on PRICE STRUCTURE and DISTANCE FROM ENTRY, not leverage-amplified PnL.
 
-Reason: Most limit/void entries experience an initial fakeout or retrace before
-moving to target. This is normal. The first 5 minutes are the highest-noise window.
+If price is within noise zone, ignore PnL color completely.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-MICRO REVERSALS ARE NORMAL — DO NOT PANIC
+HOLD CONFIDENCE DECAY (TIME-BASED RULE)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Small timeframe reversals immediately after entry are EXPECTED market behavior.
-Crypto futures markets routinely:
-  • Sweep liquidity below/above entry before moving to target
-  • Print fake breakouts on 1m/3m before reclaiming structure
-  • Show delta flips on small timeframes during consolidation
+- 0 – 5 minutes: VERY STRONG HOLD bias. CLOSE not allowed unless:
+    * SL level nearly hit (within 0.3%)
+    * abnormal_move = true on 15m+ timeframe
+    * HTF structure clearly broken on 15m or higher
+- 5 – 15 minutes: normal HOLD bias. Still need multiple HTF confirmations to CLOSE.
+- 15+ minutes: structure monitoring increases, but still need Tier1 confirmations.
 
-Do NOT CLOSE because of:
-  - A single micro_break on 1m or 3m
-  - A temporary delta flip on 1m or 3m
-  - One or two bearish/bullish impulse candles against the position
-  - ADX dropping after entry (consolidation is normal)
-  - Price slightly below/above entry (still within normal retrace range)
+The first minutes after entry are the highest-noise window. Be patient.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-HOW TO USE BACKEND CONTEXT
+SIGNAL HIERARCHY (PREVENT NOISE OVERLOAD)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-VOLUME DELTA / CVD:
-- Delta flips on 1m/3m are NORMAL and NOT a CLOSE signal by themselves.
-- Only sustained CVD divergence on 15m+ is meaningful for CLOSE consideration.
-- LONG: delta_last_5 strongly negative on 15m+ AND CVD diverging → early warning, consider SL+
-- SHORT: buyer_pressure flipping bullish on 15m+ AND CVD rising → early warning, consider SL+
-- Alone, volume delta is a WARNING signal, not a CLOSE trigger.
-
-MOMENTUM (ADX):
-- ADX dropping after entry is NORMAL — market consolidates before expanding.
-- ADX weakening alone is NOT sufficient reason to CLOSE. Use as supporting context only.
-- ADX > 25 on 15m+: trend still strong → HOLD
-- ADX < 18 on 15m+ AND combined with structure break AND delta divergence → lean CLOSE
-
-SWING STRUCTURE:
-- micro_break = true on 1m/3m → this is NOISE on small TF → treat as WARNING only, NOT CLOSE
-- micro_break = true on 15m+ → stronger signal → assess with other confirmations
-- last_higher_low (LONG) or last_lower_high (SHORT) violated on 1H/4H → serious → lean CLOSE
-- Structure breaks on small TFs (1m, 3m) MUST be confirmed on 15m or higher before CLOSE.
-
-LIQUIDITY SWEEP:
-- sweep_low_recovery on LONG → possible reversal or SL hunt → SL+ if in profit, or HOLD
-- sweep_high_rejection on SHORT → SL hunt possible → SL+ if in profit, or HOLD
-- Combined with 15m+ delta divergence → lean CLOSE
-
-ATR PULLBACK NORMALIZATION (CRITICAL):
-- current_pullback < atr_normal_pullback → NORMAL retrace → HOLD, not CLOSE
-- abnormal_move = true on 15m+ → beyond normal volatility → consider CLOSE (still need HTF confirmation)
-- abnormal_move = true on 1m/3m only → WARNING, not CLOSE
-- NEVER close because of pullback if abnormal_move = false
-
-SESSION AWARENESS:
-- ASIA session: thin volume, fakeouts common — be extra patient with reversals
-- NY_OPEN / LONDON: expansion phase — give more room, lean HOLD
-- Session close / ASIA_PRE: if floating profit → consider SL+
-
-THESIS SCORE (backend scoring):
-- score >= 3: thesis mostly intact → HOLD
-- score == 2: borderline → need other HTF confirmations before CLOSE
-- score <= 1: thesis weakening → lean SL+ or CLOSE if confirmed on HTF
-- structure_break = true on HTF (15m+) → strong signal for CLOSE
-- momentum_shift = true → consider SL+ first, CLOSE only if HTF confirms
-
-INVALIDATION vs VOLATILITY RULE:
-- abnormal_move = false + thesis_score >= 2 → HOLD
-- abnormal_move = false + thesis_score >= 3 → STRONG HOLD, no question
-- Structure break only on 1m/3m → WARNING, still HOLD unless HTF also breaks
-- Structure break on 15m+ + abnormal_move = true + delta diverging → consider CLOSE
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CLOSE DECISION — REQUIRES MULTIPLE CONFIRMATIONS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CLOSE requires at least 2 of the following 3 conditions, with at least one from the HTF tier:
-
-HTF TIER (15m or higher timeframe signals):
-  [A] HTF structure break — last_higher_low (LONG) or last_lower_high (SHORT) violated on 15m+
+TIER 1 — Hard Truth (sufficient alone to consider CLOSE if multiple)
+  [A] HTF structure break (15m+ last_higher_low or last_lower_high violated)
   [B] abnormal_move = true on 15m+ (price moved beyond normal ATR range)
   [C] thesis_score <= 1 (original entry thesis has mostly broken down)
 
-SUPPORTING TIER (adds weight but not sufficient alone):
+TIER 2 — Context (adds weight but not sufficient alone)
   [D] Sustained CVD divergence on 15m+ (not 1m/3m delta flip)
   [E] ADX < 18 on 15m+ AND candle velocity collapsed AND delta reversed
   [F] Liquidity sweep + delta divergence combined on 15m+
 
-MINIMUM REQUIREMENT FOR CLOSE:
-  → Need ([A] OR [B] OR [C]) AND at least one supporting signal from [D], [E], or [F]
-  → OR: [A] + [B] together (two HTF confirmations) is sufficient alone
-  → Single signal only → HOLD or SL+ at most
+TIER 3 — Noise (ignore for CLOSE unless confirmed by Tier1/2)
+  - 1m/3m micro_break
+  - 1m/3m delta flip
+  - Single bearish/bullish impulse candle
+  - ADX dropping within 5 minutes after entry
 
-Do NOT CLOSE based on:
-  - micro_break on 1m/3m alone
-  - ADX weakening alone
-  - Delta flip on 1m/3m alone
-  - "Risk/reward no longer justifies holding" without concrete HTF invalidation
-  - Price slightly against position (within ATR normal range)
+CLOSE requires: ([A] OR [B] OR [C]) AND at least one from Tier2.
+OR: [A] + [B] together is sufficient.
+
+If only Tier3 signals present → HOLD.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 SL+ (Move Stop Loss)
@@ -250,19 +193,19 @@ HOLD DECISION
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Use when (any of these):
 - The original analysis thesis is still intact on HTF
-- Price is in normal pullback/consolidation within trade direction
+- Price is within noise zone or normal pullback/consolidation within trade direction
 - abnormal_move = false (ATR context confirms this is normal retrace)
 - thesis_score >= 2 and no HTF structure break
 - TP is still reachable from current price structure
-- Position was opened recently (< 15 min) and no HTF invalidation has occurred
-- Only LTF (1m/3m) signals are against position, but HTF is still intact
-- Signals are mixed or ambiguous — when in doubt, HOLD
+- Position age < 5 minutes (unless HTF break or abnormal move)
+- Only Tier3 signals are against position, but HTF is still intact
+- When in doubt → HOLD
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 OUTPUT FORMAT
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Respond with EXACTLY this JSON and nothing else:
-  {"decision": "HOLD" or "CLOSE" or "SL+", "reason": "max 120 chars", "new_sl": <number or null>}
+  {{"decision": "HOLD" or "CLOSE" or "SL+", "reason": "max 120 chars", "new_sl": <number or null>}}
 - "new_sl" is REQUIRED when decision is "SL+" — must be a number (the new stop-loss price)
 - "new_sl" must be null for HOLD and CLOSE
 - No markdown, no preamble, no extra text outside the JSON
@@ -332,6 +275,10 @@ class PositionAIClient:
         tp1: float = None,
         position_context: dict = None,
     ) -> Optional[dict]:
+        # Hitung price distance from entry (real market move, bukan leverage amplified)
+        price_distance_pct = round((current_price - entry) / entry * 100, 4) if entry > 0 else 0.0
+        abs_distance_pct = abs(price_distance_pct)
+
         if direction == "LONG":
             pnl_pct = round((current_price - entry) / entry * 100, 3)
             pct_to_tp = round((tp - current_price) / current_price * 100, 3)
@@ -356,11 +303,15 @@ class PositionAIClient:
         # ── Build time context block ───────────────────────────────────
         opened_str = _fmt_ts(opened_at)
         elapsed_str = _elapsed(opened_at)
+        elapsed_seconds = int(time.time() - (opened_at / 1000)) if opened_at else 999999
+        is_young = elapsed_seconds < MIN_HOLD_TIME_SECONDS
+
         time_block = (
             f"\n━━━ POSITION TIMING ━━━\n"
             f" Opened At: {opened_str}\n"
             f" Time Elapsed: {elapsed_str}\n"
             f" Current Time: {datetime.now(tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
+            f" Is young (< {MIN_HOLD_TIME_SECONDS}s): {'YES (strong HOLD bias)' if is_young else 'NO'}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━\n"
         )
 
@@ -490,6 +441,7 @@ class PositionAIClient:
                 lines.append(f"{c[0]}, {c[1]}, {c[2]}, {c[3]}, {c[4]}, {c[5]}")
             ohlcv_blocks.append("\n".join(lines))
 
+        # Tampilkan price distance (real market move) lebih menonjol, PnL sebagai secondary
         user_text = (
             f"ACTIVE POSITION — HOLD, CLOSE, or SL+?\n"
             f"{time_block}"
@@ -501,11 +453,13 @@ class PositionAIClient:
             f" Direction: {direction}\n"
             f" Entry: {entry}\n"
             f" Current Price: {current_price}\n"
+            f" PRICE DISTANCE FROM ENTRY: {price_distance_pct:+.4f}%  ← REAL MARKET MOVE (leverage not applied)\n"
+            f" (Noise zone threshold = ±{ENTRY_NOISE_ZONE_PCT}% — within this zone = normal rotation)\n"
             f" Take Profit: {tp} ({pct_to_tp:+.3f}% away)\n"
             f" Stop Loss: {sl} (-{pct_to_sl:.3f}% away)\n"
             f" TP1 Level: {tp1 if tp1 else 'N/A'}\n"
             f" TP1 Hit: {'YES ✅' if tp1_hit else 'NO'}\n"
-            f" {pnl_icon} Unrealized PnL: {sign}{pnl_pct}% ({sign}{pnl_usdt} USDT)\n"
+            f" {pnl_icon} Unrealized PnL (leveraged): {sign}{pnl_pct}% ({sign}{pnl_usdt} USDT) — this is AMPLIFIED by {leverage}x, not raw price move\n"
             f" Leverage: {leverage}x\n"
             f" Margin Used: {margin_usdt} USDT\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -514,12 +468,16 @@ class PositionAIClient:
             f"Charts attached above.\n"
             f"Remember: this position was opened {elapsed_str}. "
             f"Judge whether the ORIGINAL HTF THESIS is still valid — NOT just current price.\n"
+            f"If price distance is within {ENTRY_NOISE_ZONE_PCT}%, you are in ENTRY NOISE ZONE → STRONG HOLD bias.\n"
             f"LTF (1m/3m) noise, micro_break, or delta flip alone is NOT enough to CLOSE.\n"
-            f"CLOSE requires multiple HTF confirmations. DEFAULT = HOLD. When in doubt → HOLD.\n"
+            f"CLOSE requires multiple HTF confirmations (Tier1+). DEFAULT = HOLD. When in doubt → HOLD.\n"
             f"If TP1 has been HIT and position is in PROFIT → return SL+ to lock gains.\n"
             f'Respond ONLY with JSON: {{"decision": "HOLD"|"CLOSE"|"SL+", "reason": "brief reason", "new_sl": <number or null>}}\n'
             f'For SL+: provide new_sl as a number (new stop-loss price). For HOLD/CLOSE: new_sl must be null.'
         )
+
+        # Inject noise zone pct ke system prompt (dinamis)
+        dynamic_system_prompt = POSITION_SYSTEM_PROMPT.format(ENTRY_NOISE_ZONE_PCT=ENTRY_NOISE_ZONE_PCT)
 
         # Upload chart images to OSS
         uploaded_files = []
@@ -534,7 +492,7 @@ class PositionAIClient:
                     if uf:
                         uploaded_files.append(uf)
 
-        full_prompt = POSITION_SYSTEM_PROMPT + "\n\n---\n\n" + user_text
+        full_prompt = dynamic_system_prompt + "\n\n---\n\n" + user_text
 
         full_text = ""
         lock = ai_lock()
