@@ -359,9 +359,25 @@ class BotEngine:
                     # ── Kirim ke AI secara paralel (tiap simbol pakai token berbeda) ──
                     print(f" Sending {len(ai_batch)} parallel AI request(s): "
                           f"{[x[0] for x in ai_batch]}")
-                    ai_results = await qwen_ai.analyze_parallel(
-                        ai_batch, concurrency=SCAN_BATCH_SIZE
-                    )
+                    # Safety net: 12 menit max per batch (sedikit di atas per-symbol cap 10 menit
+                    # di qwen_ai._analyze_with_client, biar individual timeout jalan duluan).
+                    # Ini fallback kalau ada edge-case yang lolos dari per-symbol timeout.
+                    BATCH_TIMEOUT = 720  # 12 menit
+                    try:
+                        ai_results = await asyncio.wait_for(
+                            qwen_ai.analyze_parallel(ai_batch, concurrency=SCAN_BATCH_SIZE),
+                            timeout=BATCH_TIMEOUT,
+                        )
+                    except asyncio.TimeoutError:
+                        syms = [x[0] for x in ai_batch]
+                        logger.error(
+                            f"[BotEngine] Batch {syms} timeout setelah {BATCH_TIMEOUT}s "
+                            f"— batch di-skip, lanjut ke batch berikutnya"
+                        )
+                        await asyncio.sleep(INTER_SYMBOL_DELAY)
+                        continue
+
+                    ai_results = ai_results  # hasil dari wait_for di atas
 
                     # ── Proses hasil ────────────────────────────────────────────
                     for (sym, _, current_price, _, _lev), signal in zip(ai_batch, ai_results):
