@@ -60,6 +60,11 @@ def _migrate_v4(conn):
         if col not in existing_cols:
             conn.execute(f"ALTER TABLE signals ADD COLUMN {col} {ctype}")
             print(f"[DB] Migrated v4: added column {col} {ctype}")
+
+
+def init_db():
+    """Create all tables and run migrations. Called once at startup."""
+    DB_DIR.mkdir(parents=True, exist_ok=True)
     with get_db() as conn:
         sql = """
         CREATE TABLE IF NOT EXISTS users (
@@ -124,7 +129,7 @@ def _migrate_v4(conn):
         """
         conn.executescript(sql)
 
-        # Migrate existing tables
+        # Run incremental migrations for pre-existing databases
         _migrate_v2(conn)
         _migrate_v3(conn)
         _migrate_v4(conn)
