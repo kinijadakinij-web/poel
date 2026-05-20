@@ -804,6 +804,7 @@ If there is NO clear void/imbalance setup → return "NO TRADE". Do NOT force a 
         # ── 4. Create chat, stream response, cleanup ─────────────────
         # Gunakan per-client lock supaya token berbeda bisa jalan paralel.
         full_text = ""
+        active_chat_id: Optional[str] = None  # disimpan untuk diteruskan ke caller jika LONG/SHORT
         async with self._get_lock():
             for attempt in range(2):
                 try:
@@ -817,13 +818,17 @@ If there is NO clear void/imbalance setup → return "NO TRADE". Do NOT force a 
                     raw_reply = await _send_stream(
                         self.token, chat_id, full_prompt, self.client, uploaded_files or None
                     )
-                    await _delete_chat(self.token, chat_id, self.client)
+                    # Jangan hapus chat di sini — keputusan hapus/simpan
+                    # ditentukan setelah parsing (LONG/SHORT → simpan, NO TRADE → hapus)
 
                     if raw_reply:
                         import re
                         full_text = re.sub(r"<think>.*?</think>", "", raw_reply, flags=re.DOTALL).strip()
+                        active_chat_id = chat_id  # simpan untuk diteruskan ke caller
                         break
 
+                    # Stream kosong — hapus chat lalu retry
+                    await _delete_chat(self.token, chat_id, self.client)
                     if attempt == 0:
                         continue
                     return self._no_trade("Empty stream response after retries")
@@ -875,6 +880,17 @@ If there is NO clear void/imbalance setup → return "NO TRADE". Do NOT force a 
             "original_prompt": full_prompt,
             "original_ai_response": full_text,
         }
+
+        # ── Hapus chat hanya jika NO TRADE.
+        # Kalau LONG/SHORT → simpan chat_id supaya position_ai bisa lanjutkan
+        # sesi yang sama, dan hapus nanti ketika posisi di-close.
+        if decision == "NO TRADE":
+            if active_chat_id:
+                await _delete_chat(self.token, active_chat_id, self.client)
+        else:
+            parsed["analysis_chat_id"] = active_chat_id
+            parsed["analysis_token"] = self.token
+            print(f"{tag} 💾 Chat room {active_chat_id} disimpan untuk posisi {decision} {symbol}")
 
         print(
             f"{tag} ✅ {symbol} → {decision} "
