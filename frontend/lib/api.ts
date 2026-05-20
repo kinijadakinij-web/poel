@@ -1,6 +1,9 @@
 // api.ts — inline config (no external config file needed)
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
-const API_KEY = process.env.NEXT_PUBLIC_API_KEY || "";
+
+// ⚠️  API_KEY TIDAK BOLEH di sini — jangan pakai NEXT_PUBLIC_ untuk secret.
+// Semua request yang butuh X-API-Key harus lewat Next.js API route proxy
+// di /pages/api/proxy/[...path].ts yang inject key dari server-side env.
 
 function getTimestamp() {
   return Date.now().toString();
@@ -10,16 +13,24 @@ export async function apiFetch(
   path: string,
   options: RequestInit = {}
 ): Promise<any> {
-  const url = `${API_BASE}${path}`;
-  const token = getToken();  // ← ambil token
+  // Endpoint public (GET read-only) → langsung ke backend, tanpa API key
+  // Endpoint yang butuh auth → lewat /api/proxy/... (server-side inject key)
+  const isPublicGet =
+    options.method === undefined || options.method === "GET";
+
+  const url = isPublicGet
+    ? `${API_BASE}${path}`
+    : `/api/proxy${path}`; // ← POST/PUT/DELETE lewat proxy
+
+  const token = getToken();
   const res = await fetch(url, {
     ...options,
     headers: {
       "Content-Type": "application/json",
-      "X-API-Key": API_KEY,
       "X-Timestamp": getTimestamp(),
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),  // ← auto-kirim token
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...(options.headers || {}),
+      // X-API-Key TIDAK dikirim dari browser — proxy yang inject
     },
   });
 
