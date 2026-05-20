@@ -13,7 +13,7 @@ async function proxyRequest(req: NextRequest, params: { path: string[] }) {
   const subPath = params.path.join("/");
   const { searchParams } = new URL(req.url);
   const qs = searchParams.toString() ? `?${searchParams.toString()}` : "";
-  const targetUrl = `${BACKEND}/api/${subPath}${qs}`;
+  const targetUrl = `${BACKEND}/${subPath}${qs}`;
 
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
