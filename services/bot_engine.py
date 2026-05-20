@@ -474,6 +474,10 @@ class BotEngine:
             "original_prompt": signal.get("original_prompt"),
             "original_ai_response": signal.get("original_ai_response"),
             "entry_hit_at": None,  # diisi saat entry price tercapai
+            # Chat room Qwen yang dibuat saat analisis — disimpan agar position_ai
+            # bisa lanjutkan sesi yang sama, dan dihapus saat posisi di-close.
+            "trade_chat_id": signal.get("analysis_chat_id"),
+            "trade_token": signal.get("analysis_token"),
         }
 
         _entry = signal_record.get("entry") or current_price
