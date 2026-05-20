@@ -935,10 +935,13 @@ class BotEngine:
             return {k: v for k, v in sig.items() if k not in _INTERNAL_FIELDS}
 
         sanitized_signals = [_sanitize_signal(s) for s in self.state.get("signals", [])]
+        raw_last = self.state.get("last_signal")
+        sanitized_last = _sanitize_signal(raw_last) if raw_last else None
 
         return {
             **self.state,
             "signals": sanitized_signals,
+            "last_signal": sanitized_last,
             "winrate": winrate,
             "active_signal_count": active,
             "max_active_signals": MAX_ACTIVE_SIGNALS,
