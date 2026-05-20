@@ -1073,15 +1073,41 @@ class ParallelQwenAI:
         backend_context: dict = None,
         leverage: int = 10,
     ) -> dict:
-        """Analisis satu simbol dengan client tertentu; rotate+retry kalau 502/RateLimited."""
-        result = await client.analyze(symbol, candles_by_tf, current_price, backend_context, leverage)
+        """Analisis satu simbol dengan client tertentu; rotate+retry kalau 502/RateLimited.
+
+        Hard cap 10 menit per symbol — kalau Qwen streaming tidak selesai dalam batas ini,
+        langsung return NO TRADE agar asyncio.gather() tidak block seluruh batch.
+        """
+        MAX_ANALYSIS_SECONDS = 600  # 10 menit hard cap per symbol
+
+        try:
+            result = await asyncio.wait_for(
+                client.analyze(symbol, candles_by_tf, current_price, backend_context, leverage),
+                timeout=MAX_ANALYSIS_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[QwenAI] {symbol} analisis TIMEOUT setelah {MAX_ANALYSIS_SECONDS}s "
+                f"— slot {client.slot} diabaikan, return NO TRADE"
+            )
+            return self._no_trade(f"Analysis timeout after {MAX_ANALYSIS_SECONDS}s")
 
         if self._should_rotate(result.get("reason", "")):
             self._rotate(result["reason"])
             retry = self._current_client()
             if retry and retry is not client:
                 print(f"[QwenAI] Retry {symbol} → slot {retry.slot}")
-                result = await retry.analyze(symbol, candles_by_tf, current_price, backend_context, leverage)
+                try:
+                    result = await asyncio.wait_for(
+                        retry.analyze(symbol, candles_by_tf, current_price, backend_context, leverage),
+                        timeout=MAX_ANALYSIS_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        f"[QwenAI] {symbol} retry TIMEOUT setelah {MAX_ANALYSIS_SECONDS}s "
+                        f"— slot {retry.slot} diabaikan, return NO TRADE"
+                    )
+                    return self._no_trade(f"Retry timeout after {MAX_ANALYSIS_SECONDS}s")
 
         return result
 
