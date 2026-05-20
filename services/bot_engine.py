@@ -923,8 +923,22 @@ class BotEngine:
         winrate = round(wins / closed * 100, 2) if closed > 0 else 0.0
         active = self._active_count()
         balance_info = virtual_exchange.get_info(self.user_id)
+
+        # Field internal yang tidak boleh di-expose ke API publik
+        _INTERNAL_FIELDS = {
+            "original_prompt", "original_ai_response",
+            "trade_chat_id", "trade_token",
+            "analysis_chat_id", "analysis_token",
+        }
+
+        def _sanitize_signal(sig: dict) -> dict:
+            return {k: v for k, v in sig.items() if k not in _INTERNAL_FIELDS}
+
+        sanitized_signals = [_sanitize_signal(s) for s in self.state.get("signals", [])]
+
         return {
             **self.state,
+            "signals": sanitized_signals,
             "winrate": winrate,
             "active_signal_count": active,
             "max_active_signals": MAX_ACTIVE_SIGNALS,
