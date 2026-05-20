@@ -11,6 +11,12 @@ _rate_limit_store = {}
 # Path yang selalu public (tanpa API Key)
 PUBLIC_PATHS = {"/api/health", "/api/bot/ws"}
 
+# POST endpoints public — auth tidak butuh API Key, JWT yang protect setelahnya
+PUBLIC_POST_PATHS = {
+    "/api/auth/login",
+    "/api/auth/register",
+}
+
 # Path read-only GET yang public (exact match)
 PUBLIC_GET_PATHS = {
     "/api/history/signals",
@@ -48,6 +54,10 @@ class SecurityMiddleware(BaseHTTPMiddleware):
 
         # Admin routes — auth di-handle oleh JWT require_admin di dalam route
         if path.startswith("/api/admin/") or path == "/api/admin":
+            return await call_next(request)
+
+        # Public POST: auth endpoints
+        if request.method == "POST" and path in PUBLIC_POST_PATHS:
             return await call_next(request)
 
         # Public GET: exact path atau prefix match
