@@ -348,7 +348,7 @@ Use when (any of these):
 OUTPUT FORMAT
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Respond with EXACTLY this JSON and nothing else:
-  {"decision": "HOLD" or "CLOSE" or "SL+", "reason": "max 120 chars", "new_sl": <number or null>}
+  {{"decision": "HOLD" or "CLOSE" or "SL+", "reason": "max 120 chars", "new_sl": <number or null>}}
 - "new_sl" is REQUIRED when decision is "SL+" — must be a number (the new stop-loss price)
 - "new_sl" must be null for HOLD and CLOSE
 - No markdown, no preamble, no extra text outside the JSON
