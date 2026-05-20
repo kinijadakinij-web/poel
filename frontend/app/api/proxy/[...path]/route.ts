@@ -1,54 +1,56 @@
-// pages/api/proxy/[...path].ts
+// app/api/proxy/[...path]/route.ts
 // Server-side proxy — inject X-API-Key tanpa expose ke browser.
-// Semua POST/PUT/DELETE dari frontend diarahkan ke sini.
-//
-// Env yang dibutuhkan (server-side only, BUKAN NEXT_PUBLIC_):
-//   API_URL     = https://grthrrh-production.up.railway.app
-//   API_KEY     = agx_prod_...  ← secret, hanya ada di server
+// Env (server-side only, BUKAN NEXT_PUBLIC_):
+//   API_URL = https://grthrrh-production.up.railway.app
+//   API_KEY = agx_prod_...
 
-import type { NextApiRequest, NextApiResponse } from "next";
+import { NextRequest, NextResponse } from "next/server";
 
 const BACKEND = process.env.API_URL || "";
-const API_KEY  = process.env.API_KEY  || "";  // ← BUKAN NEXT_PUBLIC_
+const API_KEY  = process.env.API_KEY  || "";
 
-export default async function handler(
-  req: NextApiRequest,
-  res: NextApiResponse
-) {
-  const { path } = req.query;
-  const subPath = Array.isArray(path) ? path.join("/") : path || "";
-  const qs = new URLSearchParams(
-    req.query as Record<string, string>
-  );
-  // Hapus 'path' dari query string (itu parameter Next.js catch-all)
-  qs.delete("path");
-  const qsStr = qs.toString() ? `?${qs.toString()}` : "";
+async function proxyRequest(req: NextRequest, params: { path: string[] }) {
+  const subPath = params.path.join("/");
+  const { searchParams } = new URL(req.url);
+  const qs = searchParams.toString() ? `?${searchParams.toString()}` : "";
+  const targetUrl = `${BACKEND}/api/${subPath}${qs}`;
 
-  const targetUrl = `${BACKEND}/api/${subPath}${qsStr}`;
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "X-API-Key": API_KEY,
+    "X-Timestamp": Date.now().toString(),
+  };
 
-  try {
-    const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-      "X-API-Key": API_KEY,              // inject di server, tidak pernah ke browser
-      "X-Timestamp": Date.now().toString(),
-    };
+  const auth = req.headers.get("authorization");
+  if (auth) headers["Authorization"] = auth;
 
-    // Forward Authorization header dari client jika ada
-    if (req.headers.authorization) {
-      headers["Authorization"] = req.headers.authorization;
-    }
+  const body =
+    req.method !== "GET" && req.method !== "HEAD"
+      ? await req.text()
+      : undefined;
 
-    const backendRes = await fetch(targetUrl, {
-      method: req.method,
-      headers,
-      body: req.method !== "GET" && req.method !== "HEAD"
-        ? JSON.stringify(req.body)
-        : undefined,
-    });
+  const backendRes = await fetch(targetUrl, {
+    method: req.method,
+    headers,
+    body,
+  });
 
-    const data = await backendRes.json().catch(() => ({}));
-    res.status(backendRes.status).json(data);
-  } catch (err: any) {
-    res.status(502).json({ detail: "Proxy error", error: err.message });
-  }
+  const data = await backendRes.json().catch(() => ({}));
+  return NextResponse.json(data, { status: backendRes.status });
+}
+
+export async function GET(req: NextRequest, { params }: { params: { path: string[] } }) {
+  return proxyRequest(req, params);
+}
+export async function POST(req: NextRequest, { params }: { params: { path: string[] } }) {
+  return proxyRequest(req, params);
+}
+export async function PUT(req: NextRequest, { params }: { params: { path: string[] } }) {
+  return proxyRequest(req, params);
+}
+export async function DELETE(req: NextRequest, { params }: { params: { path: string[] } }) {
+  return proxyRequest(req, params);
+}
+export async function PATCH(req: NextRequest, { params }: { params: { path: string[] } }) {
+  return proxyRequest(req, params);
 }
